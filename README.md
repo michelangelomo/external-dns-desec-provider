@@ -84,6 +84,13 @@ This value file will run webhook server along with external-dns as sidecar.
 | WEBHOOK_PORT          | Webhook port                   | Default: `8888`      |
 | WEBHOOK_LOGLEVEL     | Log level (debug, info, etc.)  | Default: `info`      |
 
+### Healthcheck configuration
+
+| Variable              | Description                    | Notes                |
+| --------------------- | ------------------------------ | -------------------- |
+| WEBHOOK_HEALTHADDRESS       | Healthcheck hostname or IP address | Default: `0.0.0.0` |
+| WEBHOOK_HEALTHPORT          | Webhook port                   | Default: `8080`      |
+
 ## Local Development
 
 ```shell

@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"io/ioutil"
 	"net/http"
@@ -14,7 +15,7 @@ import (
 )
 
 type WebhookServer struct {
-	server *mux.Router
+	httpServer *http.Server
 }
 
 type webhook struct {
@@ -32,8 +33,6 @@ func NewWebhookServer(desecClient *provider.DesecClient, config config.Config) *
 	webhook.config = config
 
 	mux := mux.NewRouter()
-	mux.HandleFunc("/healthz", healthzHandler).Methods("GET")
-	mux.HandleFunc("/readyz", readyzHandler).Methods("GET")
 	mux.HandleFunc("/", webhook.negotiateHandler).Methods("GET")
 	mux.HandleFunc("/records", webhook.recordsHandler).Methods("GET")
 	mux.HandleFunc("/records", webhook.updateRecordsHandler).Methods("POST")
@@ -43,15 +42,23 @@ func NewWebhookServer(desecClient *provider.DesecClient, config config.Config) *
 	mux.Use(externalDnsContentTypeMiddleware)
 
 	return &WebhookServer{
-		server: mux,
+		httpServer: &http.Server{
+			Addr:    config.GetListeningAddress(),
+			Handler: mux,
+		},
 	}
 }
 
+// Run starts the server in a non-blocking way when called with a goroutine
 func (server *WebhookServer) Run(config config.Config) error {
-	return http.ListenAndServe(
-		config.GetListeningAddress(),
-		server.server,
-	)
+	// The underlying http.Server.ListenAndServe is still blocking
+	// but we can now reference the server for graceful shutdown
+	return server.httpServer.ListenAndServe()
+}
+
+// Shutdown gracefully shuts down the server
+func (server *WebhookServer) Shutdown(ctx context.Context) error {
+	return server.httpServer.Shutdown(ctx)
 }
 
 func externalDnsContentTypeMiddleware(next http.Handler) http.Handler {

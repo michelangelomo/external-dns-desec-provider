@@ -15,6 +15,9 @@ type Config struct {
 	WebhookAddress string `default:"127.0.0.1"`
 	WebhookPort    int    `default:"8888"`
 
+	HealthAddress string `default:"0.0.0.0"`
+	HealthPort    int    `default:"8080"`
+
 	LogLevel log.Level `default:"info"`
 }
 
@@ -31,4 +34,8 @@ func LoadConfig() (Config, error) {
 
 func (config Config) GetListeningAddress() string {
 	return fmt.Sprintf("%s:%d", config.WebhookAddress, config.WebhookPort)
+}
+
+func (config Config) GetHealthListeningAddress() string {
+	return fmt.Sprintf("%s:%d", config.HealthAddress, config.HealthPort)
 }
