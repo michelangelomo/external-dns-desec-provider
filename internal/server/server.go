@@ -2,6 +2,7 @@ package server
 
 import (
 	"encoding/json"
+	"io/ioutil"
 	"net/http"
 
 	"github.com/gorilla/mux"
@@ -35,6 +36,8 @@ func NewWebhookServer(desecClient *provider.DesecClient, config config.Config) *
 	mux.HandleFunc("/readyz", readyzHandler).Methods("GET")
 	mux.HandleFunc("/", webhook.negotiateHandler).Methods("GET")
 	mux.HandleFunc("/records", webhook.recordsHandler).Methods("GET")
+	mux.HandleFunc("/records", webhook.updateRecordsHandler).Methods("POST")
+	mux.HandleFunc("/adjustendpoints", webhook.adjustEndpointsHandler).Methods("POST")
 
 	mux.Use(NewLogger(LogOptions{EnableStarting: true, Formatter: logrus.StandardLogger().Formatter}).Middleware)
 	mux.Use(externalDnsContentTypeMiddleware)
@@ -88,4 +91,27 @@ func (webhook webhook) recordsHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	json.NewEncoder(w).Encode(endpoints)
+}
+
+func (webhook webhook) updateRecordsHandler(w http.ResponseWriter, r *http.Request) {
+	body, err := ioutil.ReadAll(r.Body)
+	if err != nil {
+		panic(err)
+	}
+	log.Debugf("updateRecordsHandler: %+v", string(body))
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (webhook webhook) adjustEndpointsHandler(w http.ResponseWriter, r *http.Request) {
+	adjustedEndpoints := []*endpoint.Endpoint{}
+
+	err := json.NewDecoder(r.Body).Decode(&adjustedEndpoints)
+	if err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+
+	log.Debugf("updateRecordsHandler: %+v", adjustedEndpoints)
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(adjustedEndpoints)
 }
