@@ -37,6 +37,7 @@ func NewWebhookServer(desecClient *provider.DesecClient, config config.Config) *
 	mux.HandleFunc("/records", webhook.recordsHandler).Methods("GET")
 
 	mux.Use(NewLogger(LogOptions{EnableStarting: true, Formatter: logrus.StandardLogger().Formatter}).Middleware)
+	mux.Use(externalDnsContentTypeMiddleware)
 
 	return &WebhookServer{
 		server: mux,
@@ -48,6 +49,13 @@ func (server *WebhookServer) Run(config config.Config) error {
 		config.GetListeningAddress(),
 		server.server,
 	)
+}
+
+func externalDnsContentTypeMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Add("Content-Type", externalDnsWebhookHeader)
+		next.ServeHTTP(w, r)
+	})
 }
 
 func (webhook webhook) negotiateHandler(w http.ResponseWriter, r *http.Request) {
