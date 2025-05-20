@@ -2,9 +2,14 @@ package provider
 
 import (
 	"context"
+	"strings"
 
 	"github.com/michelangelomo/external-dns-desec-provider/internal/config"
 	"github.com/nrdcg/desec"
+	log "github.com/sirupsen/logrus"
+	"golang.org/x/net/publicsuffix"
+	"sigs.k8s.io/external-dns/endpoint"
+	"sigs.k8s.io/external-dns/plan"
 )
 
 type DesecClient struct {
@@ -27,4 +32,162 @@ func (d *DesecClient) GetDomains() ([]desec.Domain, error) {
 
 func (d *DesecClient) GetRecords(domain string) ([]desec.RRSet, error) {
 	return d.client.Records.GetAll(d.ctx, domain, nil)
+}
+
+func (d *DesecClient) ApplyChanges(changes plan.Changes) error {
+	// Create new records
+	for domain, endpoints := range mapEndpointsByHostname(changes.Create) {
+		var toCreate []desec.RRSet
+		// Convert endpoint from external-dns to desec.RRSet
+		for _, endpoint := range endpoints {
+			toCreate = append(toCreate, *convertEndpointToRRSet(endpoint))
+		}
+
+		// Create the records in desec
+		_, err := d.client.Records.BulkCreate(d.ctx, domain, toCreate)
+		if err != nil {
+			log.Error("failed to create records", err)
+		}
+	}
+
+	// Update existing records
+	for domain, endpoints := range mapEndpointsByHostname(changes.UpdateNew) {
+		var toUpdate []desec.RRSet
+		// Convert endpoint from external-dns to desec.RRSet
+		for _, endpoint := range endpoints {
+			toUpdate = append(toUpdate, *convertEndpointToRRSet(endpoint))
+		}
+
+		// Update records in desec with bulk ops
+		_, err := d.client.Records.BulkUpdate(d.ctx, desec.FullResource, domain, toUpdate)
+		if err != nil {
+			log.Error("failed to update records", err)
+		}
+	}
+
+	// Delete records
+	for domain, endpoints := range mapEndpointsByHostname(changes.Delete) {
+		var toDelete []desec.RRSet
+		// Convert endpoint from external-dns to desec.RRSet
+		for _, endpoint := range endpoints {
+			toDelete = append(toDelete, *convertEndpointToRRSet(endpoint))
+		}
+		// Delete records in desec with bulk ops
+		err := d.client.Records.BulkDelete(d.ctx, domain, toDelete)
+		if err != nil {
+			log.Error("failed to delete records", err)
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (d *DesecClient) AdjustEndpoints(endpoints []*endpoint.Endpoint) ([]*endpoint.Endpoint, error) {
+	var updatedEndpoint []*endpoint.Endpoint
+	// Reconcile existing records
+	for domain, endpoints := range mapEndpointsByHostname(endpoints) {
+		var toReconcile []desec.RRSet
+		// Convert endpoint from external-dns to desec.RRSet
+		for _, endpoint := range endpoints {
+			toReconcile = append(toReconcile, *convertEndpointToRRSet(endpoint))
+		}
+
+		// Update records in desec with bulk ops
+		updated, err := d.client.Records.BulkUpdate(d.ctx, desec.FullResource, domain, toReconcile)
+		if err != nil {
+			log.Error("failed to update records", err)
+			return []*endpoint.Endpoint{}, err
+		}
+		for _, u := range updated {
+			updatedEndpoint = append(updatedEndpoint, convertRRSetToEndpoint(&u, domain))
+		}
+	}
+	return updatedEndpoint, nil
+}
+
+// mapEndpointsByHostname extracts hostnames from DNSName and maps them to a slice of corresponding Endpoints
+func mapEndpointsByHostname(endpoints []*endpoint.Endpoint) map[string][]*endpoint.Endpoint {
+	result := make(map[string][]*endpoint.Endpoint)
+
+	for _, ep := range endpoints {
+		if ep == nil || ep.DNSName == "" {
+			continue
+		}
+
+		parsed, err := publicsuffix.EffectiveTLDPlusOne(ep.DNSName)
+		if err != nil {
+			log.Warnf("failed to parse URL %s: %v", ep.DNSName, err)
+			continue
+		}
+
+		result[parsed] = append(result[parsed], ep)
+	}
+
+	return result
+}
+
+// convertEndpointToRRSet converts an Endpoint to an RRSet
+func convertEndpointToRRSet(ep *endpoint.Endpoint) *desec.RRSet {
+	if ep == nil {
+		return nil
+	}
+
+	name := strings.TrimSuffix(ep.DNSName, ".")
+	_, subname := extractDomainAndSubname(name)
+
+	records := make([]string, len(ep.Targets))
+	for i, target := range ep.Targets {
+		records[i] = target
+	}
+
+	return &desec.RRSet{
+		SubName: subname,
+		Type:    ep.RecordType,
+		Records: records,
+		TTL:     int(ep.RecordTTL),
+	}
+}
+
+// convertRRSetToEndpoint converts an RRSet to an Endpoint
+func convertRRSetToEndpoint(rrset *desec.RRSet, domain string) *endpoint.Endpoint {
+	if rrset == nil {
+		return nil
+	}
+
+	// Compose DNSName from subname and domain
+	var dnsName string
+	if rrset.SubName == "" {
+		dnsName = domain
+	} else {
+		dnsName = rrset.SubName + "." + domain
+	}
+	dnsName = strings.TrimSuffix(dnsName, ".") + "."
+
+	targets := make(endpoint.Targets, len(rrset.Records))
+	for i, record := range rrset.Records {
+		targets[i] = record
+	}
+
+	return &endpoint.Endpoint{
+		DNSName:    dnsName,
+		RecordType: rrset.Type,
+		Targets:    targets,
+		RecordTTL:  endpoint.TTL(rrset.TTL),
+	}
+}
+
+// extractDomainAndSubname splits a DNS name into domain and subname.
+// Example: "www.example.com" -> domain: "example.com", subname: "www"
+func extractDomainAndSubname(fqdn string) (domain string, subname string) {
+	parts := strings.Split(fqdn, ".")
+	if len(parts) < 2 {
+		// fallback for invalid names
+		return fqdn, ""
+	}
+	domain = strings.Join(parts[len(parts)-2:], ".")
+	if len(parts) > 2 {
+		subname = strings.Join(parts[:len(parts)-2], ".")
+	}
+	return
 }

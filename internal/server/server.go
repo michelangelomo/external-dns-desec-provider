@@ -3,7 +3,6 @@ package server
 import (
 	"context"
 	"encoding/json"
-	"io/ioutil"
 	"net/http"
 
 	"github.com/gorilla/mux"
@@ -12,6 +11,7 @@ import (
 	"github.com/sirupsen/logrus"
 	log "github.com/sirupsen/logrus"
 	"sigs.k8s.io/external-dns/endpoint"
+	"sigs.k8s.io/external-dns/plan"
 )
 
 type WebhookServer struct {
@@ -35,7 +35,7 @@ func NewWebhookServer(desecClient *provider.DesecClient, config config.Config) *
 	mux := mux.NewRouter()
 	mux.HandleFunc("/", webhook.negotiateHandler).Methods("GET")
 	mux.HandleFunc("/records", webhook.recordsHandler).Methods("GET")
-	mux.HandleFunc("/records", webhook.updateRecordsHandler).Methods("POST")
+	mux.HandleFunc("/records", webhook.applyChangesHandler).Methods("POST")
 	mux.HandleFunc("/adjustendpoints", webhook.adjustEndpointsHandler).Methods("POST")
 
 	mux.Use(NewLogger(LogOptions{EnableStarting: true, Formatter: logrus.StandardLogger().Formatter}).Middleware)
@@ -100,12 +100,24 @@ func (webhook webhook) recordsHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(endpoints)
 }
 
-func (webhook webhook) updateRecordsHandler(w http.ResponseWriter, r *http.Request) {
-	body, err := ioutil.ReadAll(r.Body)
+func (webhook webhook) applyChangesHandler(w http.ResponseWriter, r *http.Request) {
+	var changes plan.Changes
+
+	err := json.NewDecoder(r.Body).Decode(&changes)
 	if err != nil {
-		panic(err)
+		w.WriteHeader(http.StatusBadRequest)
+		return
 	}
-	log.Debugf("updateRecordsHandler: %+v", string(body))
+	log.Debugf("applying changes: %v", changes)
+
+	err = webhook.desecClient.ApplyChanges(changes)
+	if err != nil {
+		log.Errorf("failed to apply changes: %v", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	log.Debugf("updateRecordsHandler: %+v", changes)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -117,8 +129,15 @@ func (webhook webhook) adjustEndpointsHandler(w http.ResponseWriter, r *http.Req
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
+	log.Debugf("adjusting endpoints: %v", adjustedEndpoints)
 
-	log.Debugf("updateRecordsHandler: %+v", adjustedEndpoints)
+	endpoints, err := webhook.desecClient.AdjustEndpoints(adjustedEndpoints)
+	if err != nil {
+		log.Errorf("failed to apply changes: %v", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
 	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(adjustedEndpoints)
+	json.NewEncoder(w).Encode(endpoints)
 }
