@@ -8,7 +8,6 @@ import (
 	"github.com/gorilla/mux"
 	"github.com/michelangelomo/external-dns-desec-provider/internal/config"
 	"github.com/michelangelomo/external-dns-desec-provider/internal/provider"
-	"github.com/sirupsen/logrus"
 	log "github.com/sirupsen/logrus"
 	"sigs.k8s.io/external-dns/endpoint"
 	"sigs.k8s.io/external-dns/plan"
@@ -38,7 +37,7 @@ func NewWebhookServer(desecClient *provider.DesecClient, config config.Config) *
 	mux.HandleFunc("/records", webhook.applyChangesHandler).Methods("POST")
 	mux.HandleFunc("/adjustendpoints", webhook.adjustEndpointsHandler).Methods("POST")
 
-	mux.Use(NewLogger(LogOptions{EnableStarting: true, Formatter: logrus.StandardLogger().Formatter}).Middleware)
+	mux.Use(NewLogger(LogOptions{EnableStarting: true, Formatter: log.StandardLogger().Formatter}).Middleware)
 	mux.Use(externalDnsContentTypeMiddleware)
 
 	return &WebhookServer{
@@ -72,7 +71,13 @@ func (webhook webhook) negotiateHandler(w http.ResponseWriter, r *http.Request) 
 	var domainFilter endpoint.DomainFilter
 	domainFilter.Filters = webhook.config.DomainFilters
 
-	json.NewEncoder(w).Encode(domainFilter)
+	err := json.NewEncoder(w).Encode(domainFilter)
+	if err != nil {
+		log.Errorf("failed to encode domain filter: %v", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
 }
 
 func (webhook webhook) recordsHandler(w http.ResponseWriter, r *http.Request) {
@@ -97,7 +102,13 @@ func (webhook webhook) recordsHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	json.NewEncoder(w).Encode(endpoints)
+	err := json.NewEncoder(w).Encode(endpoints)
+	if err != nil {
+		log.Errorf("failed to encode endpoints: %v", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
 }
 
 func (webhook webhook) applyChangesHandler(w http.ResponseWriter, r *http.Request) {
@@ -138,6 +149,11 @@ func (webhook webhook) adjustEndpointsHandler(w http.ResponseWriter, r *http.Req
 		return
 	}
 
+	err = json.NewEncoder(w).Encode(endpoints)
+	if err != nil {
+		log.Errorf("failed to encode endpoints: %v", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
 	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(endpoints)
 }

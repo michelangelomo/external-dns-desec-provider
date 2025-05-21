@@ -15,6 +15,7 @@ import (
 type DesecClient struct {
 	client *desec.Client
 	ctx    context.Context
+	dryRun bool
 }
 
 func CreateDesecClient(config config.Config) (*DesecClient, error) {
@@ -22,6 +23,7 @@ func CreateDesecClient(config config.Config) (*DesecClient, error) {
 	client := &DesecClient{
 		client: desec.New(config.APIToken, desec.ClientOptions{}),
 		ctx:    ctx,
+		dryRun: config.DryRun,
 	}
 	return client, nil
 }
@@ -43,10 +45,14 @@ func (d *DesecClient) ApplyChanges(changes plan.Changes) error {
 			toCreate = append(toCreate, *convertEndpointToRRSet(endpoint))
 		}
 
-		// Create the records in desec
-		_, err := d.client.Records.BulkCreate(d.ctx, domain, toCreate)
-		if err != nil {
-			log.Error("failed to create records", err)
+		if d.dryRun {
+			log.Infof("dryrun: at this point, the following records would be created: %v", toCreate)
+		} else {
+			// Create the records in desec
+			_, err := d.client.Records.BulkCreate(d.ctx, domain, toCreate)
+			if err != nil {
+				log.Error("failed to create records", err)
+			}
 		}
 	}
 
@@ -58,10 +64,14 @@ func (d *DesecClient) ApplyChanges(changes plan.Changes) error {
 			toUpdate = append(toUpdate, *convertEndpointToRRSet(endpoint))
 		}
 
-		// Update records in desec with bulk ops
-		_, err := d.client.Records.BulkUpdate(d.ctx, desec.FullResource, domain, toUpdate)
-		if err != nil {
-			log.Error("failed to update records", err)
+		if d.dryRun {
+			log.Infof("dryrun: at this point, the following records would be updated: %v", toUpdate)
+		} else {
+			// Update records in desec with bulk ops
+			_, err := d.client.Records.BulkUpdate(d.ctx, desec.FullResource, domain, toUpdate)
+			if err != nil {
+				log.Error("failed to update records", err)
+			}
 		}
 	}
 
@@ -72,11 +82,16 @@ func (d *DesecClient) ApplyChanges(changes plan.Changes) error {
 		for _, endpoint := range endpoints {
 			toDelete = append(toDelete, *convertEndpointToRRSet(endpoint))
 		}
-		// Delete records in desec with bulk ops
-		err := d.client.Records.BulkDelete(d.ctx, domain, toDelete)
-		if err != nil {
-			log.Error("failed to delete records", err)
-			return err
+
+		if d.dryRun {
+			log.Infof("dryrun: at this point, the following records would be deleted: %v", toDelete)
+		} else {
+			// Delete records in desec with bulk ops
+			err := d.client.Records.BulkDelete(d.ctx, domain, toDelete)
+			if err != nil {
+				log.Error("failed to delete records", err)
+				return err
+			}
 		}
 	}
 
@@ -93,14 +108,20 @@ func (d *DesecClient) AdjustEndpoints(endpoints []*endpoint.Endpoint) ([]*endpoi
 			toReconcile = append(toReconcile, *convertEndpointToRRSet(endpoint))
 		}
 
-		// Update records in desec with bulk ops
-		updated, err := d.client.Records.BulkUpdate(d.ctx, desec.FullResource, domain, toReconcile)
-		if err != nil {
-			log.Error("failed to update records", err)
-			return []*endpoint.Endpoint{}, err
-		}
-		for _, u := range updated {
-			updatedEndpoint = append(updatedEndpoint, convertRRSetToEndpoint(&u, domain))
+		if d.dryRun {
+			log.Infof("dryrun: at this point, the following records would be reconciled: %v", toReconcile)
+			// In dry run mode, we don't actually reconcile, just return the endpoints
+			updatedEndpoint = append(updatedEndpoint, endpoints...)
+		} else {
+			// Update records in desec with bulk ops
+			updated, err := d.client.Records.BulkUpdate(d.ctx, desec.FullResource, domain, toReconcile)
+			if err != nil {
+				log.Error("failed to update records", err)
+				return []*endpoint.Endpoint{}, err
+			}
+			for _, u := range updated {
+				updatedEndpoint = append(updatedEndpoint, convertRRSetToEndpoint(&u, domain))
+			}
 		}
 	}
 	return updatedEndpoint, nil
@@ -172,9 +193,7 @@ func convertRRSetToEndpoint(rrset *desec.RRSet, domain string) *endpoint.Endpoin
 	dnsName = strings.TrimSuffix(dnsName, ".") + "."
 
 	targets := make(endpoint.Targets, len(rrset.Records))
-	for i, record := range rrset.Records {
-		targets[i] = record
-	}
+	copy(targets, rrset.Records)
 
 	return &endpoint.Endpoint{
 		DNSName:    dnsName,
