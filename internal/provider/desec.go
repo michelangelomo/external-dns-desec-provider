@@ -133,12 +133,16 @@ func convertEndpointToRRSet(ep *endpoint.Endpoint) *desec.RRSet {
 		return nil
 	}
 
-	name := strings.TrimSuffix(ep.DNSName, ".")
-	_, subname := extractDomainAndSubname(name)
+	_, subname := extractDomainAndSubname(ep.DNSName)
 
 	records := make([]string, len(ep.Targets))
 	for i, target := range ep.Targets {
-		records[i] = target
+		rec := target
+		// Ensure CNAME records end with a dot
+		if ep.RecordType == "CNAME" && !strings.HasSuffix(rec, ".") {
+			rec = rec + "."
+		}
+		records[i] = rec
 	}
 
 	return &desec.RRSet{
