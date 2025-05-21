@@ -9,7 +9,6 @@ import (
 )
 
 type HealthServer struct {
-	server     *mux.Router
 	httpServer *http.Server
 }
 
@@ -40,10 +39,10 @@ func (server *HealthServer) Shutdown(ctx context.Context) error {
 
 func healthzHandler(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
-	w.Write([]byte("ok"))
+	_, _ = w.Write([]byte("ok"))
 }
 
 func readyzHandler(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
-	w.Write([]byte("ok"))
+	_, _ = w.Write([]byte("ok"))
 }

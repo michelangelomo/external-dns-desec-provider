@@ -193,9 +193,7 @@ func convertRRSetToEndpoint(rrset *desec.RRSet, domain string) *endpoint.Endpoin
 	dnsName = strings.TrimSuffix(dnsName, ".") + "."
 
 	targets := make(endpoint.Targets, len(rrset.Records))
-	for i, record := range rrset.Records {
-		targets[i] = record
-	}
+	copy(targets, rrset.Records)
 
 	return &endpoint.Endpoint{
 		DNSName:    dnsName,
