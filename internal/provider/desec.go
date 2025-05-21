@@ -115,7 +115,10 @@ func mapEndpointsByHostname(endpoints []*endpoint.Endpoint) map[string][]*endpoi
 			continue
 		}
 
-		parsed, err := publicsuffix.EffectiveTLDPlusOne(ep.DNSName)
+		// Trim any trailing dot before parsing
+		dnsName := strings.TrimSuffix(ep.DNSName, ".")
+
+		parsed, err := publicsuffix.EffectiveTLDPlusOne(dnsName)
 		if err != nil {
 			log.Warnf("failed to parse URL %s: %v", ep.DNSName, err)
 			continue
