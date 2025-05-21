@@ -15,7 +15,12 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
+var (
+	Version string = "v0.0.0-dev"
+)
+
 func main() {
+	log.Infof("starting external-dns-desec-provider %s", Version)
 	// Load configuration
 	config, err := config.LoadConfig()
 	if err != nil {
