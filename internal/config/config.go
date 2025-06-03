@@ -11,6 +11,7 @@ type Config struct {
 	APIToken      string   `required:"true"`
 	DryRun        bool     `default:"false"`
 	DomainFilters []string `required:"true"`
+	DefaultTTL    int      `default:"3600"`
 
 	WebhookAddress string `default:"127.0.0.1"`
 	WebhookPort    int    `default:"8888"`

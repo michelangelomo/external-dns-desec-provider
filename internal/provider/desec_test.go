@@ -261,13 +261,12 @@ func TestConvertEndpointToRRSetExtended(t *testing.T) {
 				DNSName:    "example.com",
 				RecordType: "A",
 				Targets:    endpoint.Targets{"192.0.2.1"},
-				RecordTTL:  300,
 			},
 			expected: &desec.RRSet{
 				SubName: "",
 				Type:    "A",
 				Records: []string{"192.0.2.1"},
-				TTL:     300,
+				TTL:     3600,
 			},
 		},
 		{
@@ -276,13 +275,12 @@ func TestConvertEndpointToRRSetExtended(t *testing.T) {
 				DNSName:    "www.example.com",
 				RecordType: "A",
 				Targets:    endpoint.Targets{"192.0.2.1", "192.0.2.2"},
-				RecordTTL:  300,
 			},
 			expected: &desec.RRSet{
 				SubName: "www",
 				Type:    "A",
 				Records: []string{"192.0.2.1", "192.0.2.2"},
-				TTL:     300,
+				TTL:     3600,
 			},
 		},
 		{
@@ -291,13 +289,12 @@ func TestConvertEndpointToRRSetExtended(t *testing.T) {
 				DNSName:    "www.example.com",
 				RecordType: "CNAME",
 				Targets:    endpoint.Targets{"alias.example.com"},
-				RecordTTL:  300,
 			},
 			expected: &desec.RRSet{
 				SubName: "www",
 				Type:    "CNAME",
 				Records: []string{"alias.example.com."},
-				TTL:     300,
+				TTL:     3600,
 			},
 		},
 		{
@@ -306,13 +303,12 @@ func TestConvertEndpointToRRSetExtended(t *testing.T) {
 				DNSName:    "www.example.com",
 				RecordType: "CNAME",
 				Targets:    endpoint.Targets{"alias.example.com."},
-				RecordTTL:  300,
 			},
 			expected: &desec.RRSet{
 				SubName: "www",
 				Type:    "CNAME",
 				Records: []string{"alias.example.com."},
-				TTL:     300,
+				TTL:     3600,
 			},
 		},
 		{
@@ -321,7 +317,6 @@ func TestConvertEndpointToRRSetExtended(t *testing.T) {
 				DNSName:    "_dmarc.example.com",
 				RecordType: "TXT",
 				Targets:    endpoint.Targets{"v=DMARC1; p=reject"},
-				RecordTTL:  3600,
 			},
 			expected: &desec.RRSet{
 				SubName: "_dmarc",
@@ -330,11 +325,41 @@ func TestConvertEndpointToRRSetExtended(t *testing.T) {
 				TTL:     3600,
 			},
 		},
+		{
+			name: "A record with TTL lower than minimum",
+			input: &endpoint.Endpoint{
+				DNSName:    "example.com",
+				RecordType: "A",
+				Targets:    endpoint.Targets{"192.0.2.1"},
+				RecordTTL:  300,
+			},
+			expected: &desec.RRSet{
+				SubName: "",
+				Type:    "A",
+				Records: []string{"192.0.2.1"},
+				TTL:     3600,
+			},
+		},
+		{
+			name: "A record with 2-hour TTL",
+			input: &endpoint.Endpoint{
+				DNSName:    "example.com",
+				RecordType: "A",
+				Targets:    endpoint.Targets{"192.0.2.1"},
+				RecordTTL:  7200,
+			},
+			expected: &desec.RRSet{
+				SubName: "",
+				Type:    "A",
+				Records: []string{"192.0.2.1"},
+				TTL:     7200,
+			},
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := convertEndpointToRRSet(tt.input)
+			result := convertEndpointToRRSet(tt.input, 3600)
 			if !reflect.DeepEqual(result, tt.expected) {
 				t.Errorf("convertEndpointToRRSet() = %+v, want %+v", result, tt.expected)
 			}

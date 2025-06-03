@@ -75,6 +75,10 @@ This value file will run webhook server along with external-dns as sidecar.
 | WEBHOOK_APITOKEN       | deSEC API token                    | Mandatory         |
 | WEBHOOK_DRYRUN         | If set, changes won't be applied   | Default: `false`  |
 | WEBHOOK_DOMAINFILTERS  | List of domains to manage, comma separated          | Mandatory         |
+| WEBHOOK_DEFAULTTTL     | Default TTL if not specified       | Default: `3600`  |
+
+> [!NOTE]   
+> deSEC requires a minimum TTL of 3600 seconds (https://desec.readthedocs.io/en/latest/dns/domains.html#domain-object)
 
 ### Server Configuration
 
