@@ -13,17 +13,28 @@ import (
 )
 
 type DesecClient struct {
-	client *desec.Client
-	ctx    context.Context
-	dryRun bool
+	client     *desec.Client
+	ctx        context.Context
+	dryRun     bool
+	defaultTTL int
 }
 
+const (
+	minimumTTL = 3600 // Minimum TTL for desec is 3600 seconds
+)
+
 func CreateDesecClient(config config.Config) (*DesecClient, error) {
+	if config.DefaultTTL < minimumTTL {
+		log.Warnf("default TTL %d is less than the minimum required TTL %d, setting to %d", config.DefaultTTL, minimumTTL, minimumTTL)
+		config.DefaultTTL = minimumTTL
+	}
+
 	ctx := context.Background()
 	client := &DesecClient{
-		client: desec.New(config.APIToken, desec.ClientOptions{}),
-		ctx:    ctx,
-		dryRun: config.DryRun,
+		client:     desec.New(config.APIToken, desec.ClientOptions{}),
+		ctx:        ctx,
+		dryRun:     config.DryRun,
+		defaultTTL: config.DefaultTTL,
 	}
 	return client, nil
 }
@@ -42,7 +53,7 @@ func (d *DesecClient) ApplyChanges(changes plan.Changes) error {
 		var toCreate []desec.RRSet
 		// Convert endpoint from external-dns to desec.RRSet
 		for _, endpoint := range endpoints {
-			toCreate = append(toCreate, *convertEndpointToRRSet(endpoint))
+			toCreate = append(toCreate, *convertEndpointToRRSet(endpoint, d.defaultTTL))
 		}
 
 		if d.dryRun {
@@ -61,7 +72,7 @@ func (d *DesecClient) ApplyChanges(changes plan.Changes) error {
 		var toUpdate []desec.RRSet
 		// Convert endpoint from external-dns to desec.RRSet
 		for _, endpoint := range endpoints {
-			toUpdate = append(toUpdate, *convertEndpointToRRSet(endpoint))
+			toUpdate = append(toUpdate, *convertEndpointToRRSet(endpoint, d.defaultTTL))
 		}
 
 		if d.dryRun {
@@ -80,7 +91,7 @@ func (d *DesecClient) ApplyChanges(changes plan.Changes) error {
 		var toDelete []desec.RRSet
 		// Convert endpoint from external-dns to desec.RRSet
 		for _, endpoint := range endpoints {
-			toDelete = append(toDelete, *convertEndpointToRRSet(endpoint))
+			toDelete = append(toDelete, *convertEndpointToRRSet(endpoint, d.defaultTTL))
 		}
 
 		if d.dryRun {
@@ -105,7 +116,7 @@ func (d *DesecClient) AdjustEndpoints(endpoints []*endpoint.Endpoint) ([]*endpoi
 		var toReconcile []desec.RRSet
 		// Convert endpoint from external-dns to desec.RRSet
 		for _, endpoint := range endpoints {
-			toReconcile = append(toReconcile, *convertEndpointToRRSet(endpoint))
+			toReconcile = append(toReconcile, *convertEndpointToRRSet(endpoint, d.defaultTTL))
 		}
 
 		if d.dryRun {
@@ -152,7 +163,7 @@ func mapEndpointsByHostname(endpoints []*endpoint.Endpoint) map[string][]*endpoi
 }
 
 // convertEndpointToRRSet converts an Endpoint to an RRSet
-func convertEndpointToRRSet(ep *endpoint.Endpoint) *desec.RRSet {
+func convertEndpointToRRSet(ep *endpoint.Endpoint, defaultTTL int) *desec.RRSet {
 	if ep == nil {
 		return nil
 	}
@@ -167,6 +178,11 @@ func convertEndpointToRRSet(ep *endpoint.Endpoint) *desec.RRSet {
 			rec = rec + "."
 		}
 		records[i] = rec
+	}
+
+	// Set RecordTTL to default if is empty or less than minimum TTL
+	if ep.RecordTTL == 0 || ep.RecordTTL < minimumTTL {
+		ep.RecordTTL = endpoint.TTL(defaultTTL)
 	}
 
 	return &desec.RRSet{
