@@ -389,7 +389,7 @@ func TestWebhookServerIntegration(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GET / failed: %v", err)
 	}
-	defer resp.Body.Close()
+	defer resp.Body.Close() //nolint:all
 
 	if resp.StatusCode != http.StatusOK {
 		t.Errorf("GET / status = %v, want %v", resp.StatusCode, http.StatusOK)

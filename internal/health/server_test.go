@@ -118,7 +118,7 @@ func TestHealthServerEndpoints(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			defer resp.Body.Close()
+			defer resp.Body.Close() //nolint:all
 
 			if resp.StatusCode != tt.wantCode {
 				t.Errorf("Status code = %v, want %v", resp.StatusCode, tt.wantCode)
@@ -126,7 +126,7 @@ func TestHealthServerEndpoints(t *testing.T) {
 
 			if tt.wantBody != "" {
 				body := make([]byte, len(tt.wantBody))
-				resp.Body.Read(body)
+				_, _ = resp.Body.Read(body)
 				if string(body) != tt.wantBody {
 					t.Errorf("Body = %v, want %v", string(body), tt.wantBody)
 				}
@@ -144,7 +144,7 @@ func TestHealthServerRun(t *testing.T) {
 
 	// Test that Run method sets the address correctly
 	go func() {
-		server.Run(config)
+		_ = server.Run(config)
 	}()
 
 	// Give the server a moment to start
@@ -158,7 +158,7 @@ func TestHealthServerRun(t *testing.T) {
 	// Clean shutdown
 	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
 	defer cancel()
-	server.Shutdown(ctx)
+	_ = server.Shutdown(ctx)
 }
 
 func TestHealthServerShutdown(t *testing.T) {

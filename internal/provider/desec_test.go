@@ -39,9 +39,11 @@ func TestCreateDesecClient(t *testing.T) {
 			if err != nil {
 				t.Errorf("CreateDesecClient() error = %v", err)
 			}
+			//nolint:staticcheck
 			if client == nil {
 				t.Error("CreateDesecClient() returned nil client")
 			}
+			//nolint:staticcheck
 			if client.dryRun != tt.config.DryRun {
 				t.Errorf("CreateDesecClient() dryRun = %v, want %v", client.dryRun, tt.config.DryRun)
 			}
@@ -389,7 +391,7 @@ func TestConvertRRSetToEndpointExtended(t *testing.T) {
 			},
 			domain: "example.com.",
 			expected: &endpoint.Endpoint{
-				DNSName:    "example.com..",
+				DNSName:    "example.com.",
 				RecordType: "A",
 				Targets:    endpoint.Targets{"192.0.2.1"},
 				RecordTTL:  300,

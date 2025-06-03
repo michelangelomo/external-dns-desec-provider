@@ -84,7 +84,7 @@ func TestLoadConfig(t *testing.T) {
 
 			// Set test environment variables
 			for key, value := range tt.envVars {
-				os.Setenv(key, value)
+				_ = os.Setenv(key, value)
 			}
 
 			config, err := LoadConfig()
@@ -220,6 +220,6 @@ func clearWebhookEnvVars() {
 	}
 
 	for _, envVar := range envVars {
-		os.Unsetenv(envVar)
+		_ = os.Unsetenv(envVar)
 	}
 }
