@@ -234,6 +234,12 @@ func TestExtractDomainAndSubname(t *testing.T) {
 			expectedDomain: "",
 			expectedSub:    "",
 		},
+		{
+			name:           "Root domain with trailing dot",
+			fqdn:           "example.com.",
+			expectedDomain: "example.com",
+			expectedSub:    "",
+		},
 	}
 
 	for _, tt := range tests {
@@ -246,6 +252,92 @@ func TestExtractDomainAndSubname(t *testing.T) {
 				t.Errorf("extractDomainAndSubname() subname = %v, want %v", subname, tt.expectedSub)
 			}
 		})
+	}
+}
+
+func TestRootDomainEndpointConversion(t *testing.T) {
+	// Test case that reproduces the reported bug: root domain should have empty subname
+	ep := &endpoint.Endpoint{
+		DNSName:    "example.com",
+		RecordType: "A",
+		Targets:    endpoint.Targets{"192.0.2.1"},
+		RecordTTL:  3600,
+	}
+
+	rrset := convertEndpointToRRSet(ep, 3600)
+
+	if rrset.SubName != "" {
+		t.Errorf("Root domain should have empty subname, got: %q", rrset.SubName)
+	}
+
+	if rrset.Type != "A" {
+		t.Errorf("Expected record type A, got: %q", rrset.Type)
+	}
+
+	// Test the mapping function as well
+	endpoints := []*endpoint.Endpoint{ep}
+	mapped := mapEndpointsByHostname(endpoints)
+
+	if len(mapped) != 1 {
+		t.Errorf("Expected 1 domain group, got: %d", len(mapped))
+	}
+
+	if _, exists := mapped["example.com"]; !exists {
+		t.Errorf("Expected example.com domain group not found")
+	}
+}
+
+func TestMultipleRecordTypesForSameDomain(t *testing.T) {
+	// Test case that reproduces issue #2: multiple record types for same domain
+	endpoints := []*endpoint.Endpoint{
+		{
+			DNSName:    "dummy.example.com",
+			RecordType: "A",
+			Targets:    endpoint.Targets{"192.0.2.1"},
+			RecordTTL:  3600,
+		},
+		{
+			DNSName:    "dummy.example.com",
+			RecordType: "AAAA",
+			Targets:    endpoint.Targets{"2001:db8::1"},
+			RecordTTL:  3600,
+		},
+		{
+			DNSName:    "dummy.example.com",
+			RecordType: "TXT",
+			Targets:    endpoint.Targets{"v=spf1 -all"},
+			RecordTTL:  3600,
+		},
+	}
+
+	// Test mapping - should all go to same domain group
+	mapped := mapEndpointsByHostname(endpoints)
+
+	if len(mapped) != 1 {
+		t.Errorf("Expected 1 domain group, got: %d", len(mapped))
+	}
+
+	exampleDomainEndpoints, exists := mapped["example.com"]
+	if !exists {
+		t.Errorf("Expected example.com domain group not found")
+	}
+
+	if len(exampleDomainEndpoints) != 3 {
+		t.Errorf("Expected 3 endpoints for example.com, got: %d", len(exampleDomainEndpoints))
+	}
+
+	// Test conversion - all should have same subname "dummy"
+	for i, ep := range endpoints {
+		rrset := convertEndpointToRRSet(ep, 3600)
+
+		if rrset.SubName != "dummy" {
+			t.Errorf("Endpoint %d: expected subname 'dummy', got: %q", i, rrset.SubName)
+		}
+
+		expectedType := []string{"A", "AAAA", "TXT"}[i]
+		if rrset.Type != expectedType {
+			t.Errorf("Endpoint %d: expected type %s, got: %s", i, expectedType, rrset.Type)
+		}
 	}
 }
 

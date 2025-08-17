@@ -62,7 +62,8 @@ func (d *DesecClient) ApplyChanges(changes plan.Changes) error {
 			// Create the records in desec
 			_, err := d.client.Records.BulkCreate(d.ctx, domain, toCreate)
 			if err != nil {
-				log.Error("failed to create records", err)
+				log.Errorf("failed to create records: %v", err)
+				return err
 			}
 		}
 	}
@@ -81,7 +82,8 @@ func (d *DesecClient) ApplyChanges(changes plan.Changes) error {
 			// Update records in desec with bulk ops
 			_, err := d.client.Records.BulkUpdate(d.ctx, desec.FullResource, domain, toUpdate)
 			if err != nil {
-				log.Error("failed to update records", err)
+				log.Errorf("failed to update records: %v", err)
+				return err
 			}
 		}
 	}
@@ -100,7 +102,7 @@ func (d *DesecClient) ApplyChanges(changes plan.Changes) error {
 			// Delete records in desec with bulk ops
 			err := d.client.Records.BulkDelete(d.ctx, domain, toDelete)
 			if err != nil {
-				log.Error("failed to delete records", err)
+				log.Errorf("failed to delete records: %v", err)
 				return err
 			}
 		}
@@ -127,7 +129,7 @@ func (d *DesecClient) AdjustEndpoints(endpoints []*endpoint.Endpoint) ([]*endpoi
 			// Update records in desec with bulk ops
 			updated, err := d.client.Records.BulkUpdate(d.ctx, desec.FullResource, domain, toReconcile)
 			if err != nil {
-				log.Error("failed to update records", err)
+				log.Errorf("failed to update records: %v", err)
 				return []*endpoint.Endpoint{}, err
 			}
 			for _, u := range updated {
@@ -220,16 +222,41 @@ func convertRRSetToEndpoint(rrset *desec.RRSet, domain string) *endpoint.Endpoin
 }
 
 // extractDomainAndSubname splits a DNS name into domain and subname.
+// It uses publicsuffix to correctly identify the effective TLD+1 as domain.
 // Example: "www.example.com" -> domain: "example.com", subname: "www"
+// Example: "example.com" -> domain: "example.com", subname: ""
 func extractDomainAndSubname(fqdn string) (domain string, subname string) {
-	parts := strings.Split(fqdn, ".")
-	if len(parts) < 2 {
-		// fallback for invalid names
-		return fqdn, ""
+	// Trim any trailing dot before parsing
+	cleanFQDN := strings.TrimSuffix(fqdn, ".")
+
+	if cleanFQDN == "" {
+		return "", ""
 	}
-	domain = strings.Join(parts[len(parts)-2:], ".")
-	if len(parts) > 2 {
-		subname = strings.Join(parts[:len(parts)-2], ".")
+
+	// Use publicsuffix to get the effective TLD+1 (the actual domain)
+	effectiveDomain, err := publicsuffix.EffectiveTLDPlusOne(cleanFQDN)
+	if err != nil {
+		// Fallback to naive splitting for edge cases
+		parts := strings.Split(cleanFQDN, ".")
+		if len(parts) < 2 {
+			return cleanFQDN, ""
+		}
+		domain = strings.Join(parts[len(parts)-2:], ".")
+		if len(parts) > 2 {
+			subname = strings.Join(parts[:len(parts)-2], ".")
+		}
+		return domain, subname
 	}
-	return
+
+	domain = effectiveDomain
+
+	// If the FQDN is exactly the effective domain, there's no subname
+	if cleanFQDN == effectiveDomain {
+		subname = ""
+	} else {
+		// Remove the domain part to get the subname
+		subname = strings.TrimSuffix(cleanFQDN, "."+effectiveDomain)
+	}
+
+	return domain, subname
 }
