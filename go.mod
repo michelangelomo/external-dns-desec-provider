@@ -8,8 +8,8 @@ require (
 	github.com/gorilla/mux v1.8.1
 	github.com/kelseyhightower/envconfig v1.4.0
 	github.com/nrdcg/desec v0.11.0
-	github.com/opentracing/opentracing-go v1.2.1-0.20220228012449-10b1cf09e00b
 	github.com/sirupsen/logrus v1.9.3
+	golang.org/x/net v0.40.0
 	sigs.k8s.io/external-dns v0.17.0
 )
 
@@ -25,7 +25,6 @@ require (
 	github.com/modern-go/reflect2 v1.0.2 // indirect
 	github.com/peterhellberg/link v1.2.0 // indirect
 	github.com/x448/float16 v0.8.4 // indirect
-	golang.org/x/net v0.40.0 // indirect
 	golang.org/x/sys v0.33.0 // indirect
 	golang.org/x/text v0.25.0 // indirect
 	gopkg.in/inf.v0 v0.9.1 // indirect

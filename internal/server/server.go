@@ -88,7 +88,7 @@ func (webhook webhook) recordsHandler(w http.ResponseWriter, r *http.Request) {
 		log.Debugf("getting records for domain %s", domain)
 		log.Debugf("records: %v", rrset)
 		if err != nil {
-			log.Errorf("failed to get records for domain %s: %v", domain, err.Error())
+			log.Errorf("failed to get records for domain %s: %v ", domain, err.Error())
 			continue
 		}
 
