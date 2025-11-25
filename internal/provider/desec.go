@@ -13,10 +13,11 @@ import (
 )
 
 type DesecClient struct {
-	client     *desec.Client
-	ctx        context.Context
-	dryRun     bool
-	defaultTTL int
+	client        *desec.Client
+	ctx           context.Context
+	dryRun        bool
+	defaultTTL    int
+	domainFilters []string
 }
 
 const (
@@ -31,10 +32,11 @@ func CreateDesecClient(config config.Config) (*DesecClient, error) {
 
 	ctx := context.Background()
 	client := &DesecClient{
-		client:     desec.New(config.APIToken, desec.ClientOptions{}),
-		ctx:        ctx,
-		dryRun:     config.DryRun,
-		defaultTTL: config.DefaultTTL,
+		client:        desec.New(config.APIToken, desec.ClientOptions{}),
+		ctx:           ctx,
+		dryRun:        config.DryRun,
+		defaultTTL:    config.DefaultTTL,
+		domainFilters: config.DomainFilters,
 	}
 	return client, nil
 }
@@ -49,11 +51,11 @@ func (d *DesecClient) GetRecords(domain string) ([]desec.RRSet, error) {
 
 func (d *DesecClient) ApplyChanges(changes plan.Changes) error {
 	// Create new records
-	for domain, endpoints := range mapEndpointsByHostname(changes.Create) {
+	for domain, endpoints := range d.mapEndpointsByHostname(changes.Create) {
 		var toCreate []desec.RRSet
 		// Convert endpoint from external-dns to desec.RRSet
 		for _, endpoint := range endpoints {
-			toCreate = append(toCreate, *convertEndpointToRRSet(endpoint, d.defaultTTL))
+			toCreate = append(toCreate, *convertEndpointToRRSet(endpoint, domain, d.defaultTTL))
 		}
 
 		if d.dryRun {
@@ -68,11 +70,11 @@ func (d *DesecClient) ApplyChanges(changes plan.Changes) error {
 	}
 
 	// Update existing records
-	for domain, endpoints := range mapEndpointsByHostname(changes.UpdateNew) {
+	for domain, endpoints := range d.mapEndpointsByHostname(changes.UpdateNew) {
 		var toUpdate []desec.RRSet
 		// Convert endpoint from external-dns to desec.RRSet
 		for _, endpoint := range endpoints {
-			toUpdate = append(toUpdate, *convertEndpointToRRSet(endpoint, d.defaultTTL))
+			toUpdate = append(toUpdate, *convertEndpointToRRSet(endpoint, domain, d.defaultTTL))
 		}
 
 		if d.dryRun {
@@ -87,11 +89,11 @@ func (d *DesecClient) ApplyChanges(changes plan.Changes) error {
 	}
 
 	// Delete records
-	for domain, endpoints := range mapEndpointsByHostname(changes.Delete) {
+	for domain, endpoints := range d.mapEndpointsByHostname(changes.Delete) {
 		var toDelete []desec.RRSet
 		// Convert endpoint from external-dns to desec.RRSet
 		for _, endpoint := range endpoints {
-			toDelete = append(toDelete, *convertEndpointToRRSet(endpoint, d.defaultTTL))
+			toDelete = append(toDelete, *convertEndpointToRRSet(endpoint, domain, d.defaultTTL))
 		}
 
 		if d.dryRun {
@@ -112,11 +114,11 @@ func (d *DesecClient) ApplyChanges(changes plan.Changes) error {
 func (d *DesecClient) AdjustEndpoints(endpoints []*endpoint.Endpoint) ([]*endpoint.Endpoint, error) {
 	var updatedEndpoint []*endpoint.Endpoint
 	// Reconcile existing records
-	for domain, endpoints := range mapEndpointsByHostname(endpoints) {
+	for domain, endpoints := range d.mapEndpointsByHostname(endpoints) {
 		var toReconcile []desec.RRSet
 		// Convert endpoint from external-dns to desec.RRSet
 		for _, endpoint := range endpoints {
-			toReconcile = append(toReconcile, *convertEndpointToRRSet(endpoint, d.defaultTTL))
+			toReconcile = append(toReconcile, *convertEndpointToRRSet(endpoint, domain, d.defaultTTL))
 		}
 
 		if d.dryRun {
@@ -138,37 +140,62 @@ func (d *DesecClient) AdjustEndpoints(endpoints []*endpoint.Endpoint) ([]*endpoi
 	return updatedEndpoint, nil
 }
 
+// findMatchingDomain finds the longest matching domain from the domain filters
+// Ex with filters ["sub.example.com", "example.com"]:
+// - "foo.sub.example.com" matches "sub.example.com"
+// - "bar.example.com" matches "example.com"
+// - "baz.test.example.com" matches "example.com" (test.example.com is not in filters)
+func findMatchingDomain(dnsName string, domainFilters []string) string {
+	dnsName = strings.TrimSuffix(dnsName, ".")
+
+	var longestMatch string
+	for _, filter := range domainFilters {
+		filter = strings.TrimSuffix(filter, ".")
+		// Check if dnsName ends with the filter (exact match or subdomain)
+		if dnsName == filter || strings.HasSuffix(dnsName, "."+filter) {
+			// Keep the longest match
+			if len(filter) > len(longestMatch) {
+				longestMatch = filter
+			}
+		}
+	}
+
+	return longestMatch
+}
+
 // mapEndpointsByHostname extracts hostnames from DNSName and maps them to a slice of corresponding Endpoints
-func mapEndpointsByHostname(endpoints []*endpoint.Endpoint) map[string][]*endpoint.Endpoint {
+func (d *DesecClient) mapEndpointsByHostname(endpoints []*endpoint.Endpoint) map[string][]*endpoint.Endpoint {
 	result := make(map[string][]*endpoint.Endpoint)
 
 	for _, ep := range endpoints {
 		if ep == nil || ep.DNSName == "" {
 			continue
 		}
-
+		log.Debugf("mapEndpointsByHostname(%s)", ep.DNSName)
 		// Trim any trailing dot before parsing
 		dnsName := strings.TrimSuffix(ep.DNSName, ".")
 
-		parsed, err := publicsuffix.EffectiveTLDPlusOne(dnsName)
-		if err != nil {
-			log.Warnf("failed to parse URL %s: %v", ep.DNSName, err)
+		// Find the longest matching domain from the filters
+		matchedDomain := findMatchingDomain(dnsName, d.domainFilters)
+		if matchedDomain == "" {
+			log.Warnf("no matching domain filter found for %s", ep.DNSName)
 			continue
 		}
 
-		result[parsed] = append(result[parsed], ep)
+		result[matchedDomain] = append(result[matchedDomain], ep)
 	}
 
 	return result
 }
 
 // convertEndpointToRRSet converts an Endpoint to an RRSet
-func convertEndpointToRRSet(ep *endpoint.Endpoint, defaultTTL int) *desec.RRSet {
+// domain should be the matched domain filter for this endpoint
+func convertEndpointToRRSet(ep *endpoint.Endpoint, domain string, defaultTTL int) *desec.RRSet {
 	if ep == nil {
 		return nil
 	}
 
-	_, subname := extractDomainAndSubname(ep.DNSName)
+	subname := extractSubname(ep.DNSName, domain)
 
 	records := make([]string, len(ep.Targets))
 	for i, target := range ep.Targets {
@@ -219,17 +246,45 @@ func convertRRSetToEndpoint(rrset *desec.RRSet, domain string) *endpoint.Endpoin
 	}
 }
 
+// extractSubname extracts the subdomain part from a DNS name and domain
+// extractSubname("foo.sub.example.com", "sub.example.com") -> "foo"
+// extractSubname("sub.example.com", "sub.example.com") -> ""
+func extractSubname(dnsName, domain string) string {
+	dnsName = strings.TrimSuffix(dnsName, ".")
+	domain = strings.TrimSuffix(domain, ".")
+
+	if dnsName == domain {
+		return "" // No subdomain, this is the apex
+	}
+
+	subname := strings.TrimSuffix(dnsName, "."+domain)
+	return subname
+}
+
+func extractDomainAndSubname(fqdn string) (domain, subname string, err error) {
+	// Get the eTLD+1
+	domain, err = publicsuffix.EffectiveTLDPlusOne(fqdn)
+	if err != nil {
+		return domain, "", err
+	}
+	if fqdn == domain {
+		return domain, "", nil // No subdomain
+	}
+	subname = strings.TrimSuffix(fqdn, "."+domain)
+	return domain, subname, nil
+}
+
 // extractDomainAndSubname splits a DNS name into domain and subname.
 // Example: "www.example.com" -> domain: "example.com", subname: "www"
-func extractDomainAndSubname(fqdn string) (domain string, subname string) {
-	parts := strings.Split(fqdn, ".")
-	if len(parts) < 2 {
-		// fallback for invalid names
-		return fqdn, ""
-	}
-	domain = strings.Join(parts[len(parts)-2:], ".")
-	if len(parts) > 2 {
-		subname = strings.Join(parts[:len(parts)-2], ".")
-	}
-	return
-}
+// func extractDomainAndSubname2(fqdn string) (domain string, subname string) {
+//	parts := strings.Split(fqdn, ".")
+//	if len(parts) < 2 {
+//		// fallback for invalid names
+//		return fqdn, ""
+//	}
+//	domain = strings.Join(parts[len(parts)-2:], ".")
+//	if len(parts) > 2 {
+//		subname = strings.Join(parts[:len(parts)-2], ".")
+//	}
+//	return
+//}
