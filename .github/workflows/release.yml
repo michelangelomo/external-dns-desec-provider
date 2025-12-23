@@ -4,6 +4,12 @@ on:
   push:
     tags:
       - v[0-9]+.[0-9]+.[0-9]+
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version tag to build"
+        required: true
+        type: string
 
 env:
   REGISTRY: ghcr.io
@@ -19,19 +25,25 @@ jobs:
       id-token: write
     steps:
       - name: Checkout repository
-        uses: actions/checkout\@v4
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.version || github.ref }}
 
       - name: Extract version
         id: extract_version
         run: |
-          echo "VERSION=${GITHUB_REF#refs/tags/v}" >> $GITHUB_ENV
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "VERSION=${{ inputs.version }}" >> $GITHUB_ENV
+          else
+            echo "VERSION=${GITHUB_REF#refs/tags/v}" >> $GITHUB_ENV
+          fi
 
       # Install the cosign tool
       # https://github.com/sigstore/cosign-installer
       - name: Install cosign
         uses: sigstore/cosign-installer@59acb6260d9c0ba8f4a2f9d9b48431a222b68e20 #v3.5.0
         with:
-          cosign-release: 'v2.2.4'
+          cosign-release: "v2.2.4"
 
       # Add support for multi-platform images based on QEMU
       # https://github.com/docker/setup-qemu-action
@@ -60,6 +72,8 @@ jobs:
         uses: docker/metadata-action@96383f45573cb7f253c731d3b3ab81c87ef81934 # v5.0.0
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=semver,pattern={{version}},value=${{ env.VERSION }}
 
       # Build and push Docker image with Buildx (don't push on PR)
       # https://github.com/docker/build-push-action
@@ -91,7 +105,7 @@ jobs:
         # This step uses the identity token to provision an ephemeral certificate
         # against the sigstore community Fulcio instance.
         run: echo "${TAGS}" | xargs -I {} cosign sign --yes {}@${DIGEST}
-      
+
       - name: Release
         uses: softprops/action-gh-release@v2
         if: github.ref_type == 'tag'
