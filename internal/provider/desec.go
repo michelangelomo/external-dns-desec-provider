@@ -111,33 +111,61 @@ func (d *DesecClient) ApplyChanges(changes plan.Changes) error {
 	return nil
 }
 
+// AdjustEndpoints adjusts endpoints to be compatible with deSEC requirements.
+// This method is called by external-dns on every reconciliation loop BEFORE
+// change detection.
+// - Ensures TTL meets the minimum requirement (3600 seconds)
+// - Adds trailing dots to CNAME targets
+// - Filters out endpoints that don't match the domain filters
 func (d *DesecClient) AdjustEndpoints(endpoints []*endpoint.Endpoint) ([]*endpoint.Endpoint, error) {
-	var updatedEndpoint []*endpoint.Endpoint
-	// Reconcile existing records
-	for domain, endpoints := range d.mapEndpointsByHostname(endpoints) {
-		var toReconcile []desec.RRSet
-		// Convert endpoint from external-dns to desec.RRSet
-		for _, endpoint := range endpoints {
-			toReconcile = append(toReconcile, *convertEndpointToRRSet(endpoint, domain, d.defaultTTL))
+	if endpoints == nil {
+		return []*endpoint.Endpoint{}, nil
+	}
+
+	adjustedEndpoints := make([]*endpoint.Endpoint, 0, len(endpoints))
+
+	for _, ep := range endpoints {
+		if ep == nil {
+			continue
 		}
 
-		if d.dryRun {
-			log.Infof("dryrun: at this point, the following records would be reconciled: %v", toReconcile)
-			// In dry run mode, we don't actually reconcile, just return the endpoints
-			updatedEndpoint = append(updatedEndpoint, endpoints...)
-		} else {
-			// Update records in desec with bulk ops
-			updated, err := d.client.Records.BulkUpdate(d.ctx, desec.FullResource, domain, toReconcile)
-			if err != nil {
-				log.Error("failed to update records", err)
-				return []*endpoint.Endpoint{}, err
-			}
-			for _, u := range updated {
-				updatedEndpoint = append(updatedEndpoint, convertRRSetToEndpoint(&u, domain))
-			}
+		// Check if this endpoint matches our domain filters
+		matchedDomain := findMatchingDomain(ep.DNSName, d.domainFilters)
+		if matchedDomain == "" {
+			log.Warnf("no matching domain filter found for %s", ep.DNSName)
+			continue
 		}
+
+		// Create a copy of the endpoint to avoid modifying the original
+		adjusted := &endpoint.Endpoint{
+			DNSName:          ep.DNSName,
+			RecordType:       ep.RecordType,
+			SetIdentifier:    ep.SetIdentifier,
+			RecordTTL:        ep.RecordTTL,
+			Labels:           ep.Labels,
+			ProviderSpecific: ep.ProviderSpecific,
+		}
+
+		// Adjust TTL to meet minimum requirement
+		if adjusted.RecordTTL == 0 || int(adjusted.RecordTTL) < minimumTTL {
+			adjusted.RecordTTL = endpoint.TTL(d.defaultTTL)
+		}
+
+		// Copy and adjust targets
+		adjusted.Targets = make(endpoint.Targets, len(ep.Targets))
+		for i, target := range ep.Targets {
+			rec := target
+			// Ensure CNAME records end with a dot
+			if ep.RecordType == "CNAME" && !strings.HasSuffix(rec, ".") {
+				rec = rec + "."
+			}
+			adjusted.Targets[i] = rec
+		}
+
+		adjustedEndpoints = append(adjustedEndpoints, adjusted)
 	}
-	return updatedEndpoint, nil
+
+	return adjustedEndpoints, nil
 }
 
 // findMatchingDomain finds the longest matching domain from the domain filters
