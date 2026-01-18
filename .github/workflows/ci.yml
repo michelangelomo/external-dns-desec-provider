@@ -3,7 +3,7 @@ name: CI
 # Run tests and code checks on pull requests
 on:
   pull_request:
-    branches: [ main ]
+    branches: [main]
 
 env:
   REGISTRY: ghcr.io
@@ -23,7 +23,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.24'
+          go-version: "1.24"
       - name: golangci-lint
         uses: golangci/golangci-lint-action@v8
         with:
@@ -35,6 +35,7 @@ jobs:
     name: Build & Push PR Image
     runs-on: ubuntu-latest
     needs: ci
+    if: github.event.pull_request.head.repo.full_name == github.repository
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
