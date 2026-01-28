@@ -573,36 +573,217 @@ func TestApplyChangesDryRun(t *testing.T) {
 	}
 }
 
-func TestAdjustEndpointsDryRun(t *testing.T) {
-	// Test dry run mode
-	config := config.Config{
-		APIToken:      "test-token",
-		DomainFilters: []string{"example.com"},
-		DryRun:        true,
-	}
-
-	client, err := CreateDesecClient(config)
-	if err != nil {
-		t.Fatalf("Failed to create client: %v", err)
-	}
-
-	endpoints := []*endpoint.Endpoint{
+func TestAdjustEndpoints(t *testing.T) {
+	tests := []struct {
+		name      string
+		endpoints []*endpoint.Endpoint
+		expected  []*endpoint.Endpoint
+	}{
 		{
-			DNSName:    "test.example.com",
-			RecordType: "A",
-			Targets:    endpoint.Targets{"192.0.2.1"},
-			RecordTTL:  300,
+			name: "Adjusts TTL below minimum to minimum",
+			endpoints: []*endpoint.Endpoint{
+				{
+					DNSName:    "test.example.com",
+					RecordType: "A",
+					Targets:    endpoint.Targets{"192.0.2.1"},
+					RecordTTL:  300,
+				},
+			},
+			expected: []*endpoint.Endpoint{
+				{
+					DNSName:    "test.example.com",
+					RecordType: "A",
+					Targets:    endpoint.Targets{"192.0.2.1"},
+					RecordTTL:  3600,
+				},
+			},
+		},
+		{
+			name: "Keeps TTL at or above minimum",
+			endpoints: []*endpoint.Endpoint{
+				{
+					DNSName:    "test.example.com",
+					RecordType: "A",
+					Targets:    endpoint.Targets{"192.0.2.1"},
+					RecordTTL:  7200,
+				},
+			},
+			expected: []*endpoint.Endpoint{
+				{
+					DNSName:    "test.example.com",
+					RecordType: "A",
+					Targets:    endpoint.Targets{"192.0.2.1"},
+					RecordTTL:  7200,
+				},
+			},
+		},
+		{
+			name: "Sets default TTL when TTL is zero",
+			endpoints: []*endpoint.Endpoint{
+				{
+					DNSName:    "test.example.com",
+					RecordType: "A",
+					Targets:    endpoint.Targets{"192.0.2.1"},
+					RecordTTL:  0,
+				},
+			},
+			expected: []*endpoint.Endpoint{
+				{
+					DNSName:    "test.example.com",
+					RecordType: "A",
+					Targets:    endpoint.Targets{"192.0.2.1"},
+					RecordTTL:  3600,
+				},
+			},
+		},
+		{
+			name: "Adds trailing dot to CNAME targets",
+			endpoints: []*endpoint.Endpoint{
+				{
+					DNSName:    "www.example.com",
+					RecordType: "CNAME",
+					Targets:    endpoint.Targets{"alias.example.com"},
+					RecordTTL:  3600,
+				},
+			},
+			expected: []*endpoint.Endpoint{
+				{
+					DNSName:    "www.example.com",
+					RecordType: "CNAME",
+					Targets:    endpoint.Targets{"alias.example.com."},
+					RecordTTL:  3600,
+				},
+			},
+		},
+		{
+			name: "Keeps existing trailing dot on CNAME targets",
+			endpoints: []*endpoint.Endpoint{
+				{
+					DNSName:    "www.example.com",
+					RecordType: "CNAME",
+					Targets:    endpoint.Targets{"alias.example.com."},
+					RecordTTL:  3600,
+				},
+			},
+			expected: []*endpoint.Endpoint{
+				{
+					DNSName:    "www.example.com",
+					RecordType: "CNAME",
+					Targets:    endpoint.Targets{"alias.example.com."},
+					RecordTTL:  3600,
+				},
+			},
+		},
+		{
+			name: "Does not modify A record targets",
+			endpoints: []*endpoint.Endpoint{
+				{
+					DNSName:    "test.example.com",
+					RecordType: "A",
+					Targets:    endpoint.Targets{"192.0.2.1"},
+					RecordTTL:  3600,
+				},
+			},
+			expected: []*endpoint.Endpoint{
+				{
+					DNSName:    "test.example.com",
+					RecordType: "A",
+					Targets:    endpoint.Targets{"192.0.2.1"},
+					RecordTTL:  3600,
+				},
+			},
+		},
+		{
+			name: "Handles multiple endpoints",
+			endpoints: []*endpoint.Endpoint{
+				{
+					DNSName:    "test.example.com",
+					RecordType: "A",
+					Targets:    endpoint.Targets{"192.0.2.1"},
+					RecordTTL:  300,
+				},
+				{
+					DNSName:    "www.example.com",
+					RecordType: "CNAME",
+					Targets:    endpoint.Targets{"alias.example.com"},
+					RecordTTL:  0,
+				},
+			},
+			expected: []*endpoint.Endpoint{
+				{
+					DNSName:    "test.example.com",
+					RecordType: "A",
+					Targets:    endpoint.Targets{"192.0.2.1"},
+					RecordTTL:  3600,
+				},
+				{
+					DNSName:    "www.example.com",
+					RecordType: "CNAME",
+					Targets:    endpoint.Targets{"alias.example.com."},
+					RecordTTL:  3600,
+				},
+			},
+		},
+		{
+			name:      "Handles empty endpoints",
+			endpoints: []*endpoint.Endpoint{},
+			expected:  []*endpoint.Endpoint{},
+		},
+		{
+			name:      "Handles nil endpoints slice",
+			endpoints: nil,
+			expected:  []*endpoint.Endpoint{},
+		},
+		{
+			name: "Filters out endpoints not matching domain filters",
+			endpoints: []*endpoint.Endpoint{
+				{
+					DNSName:    "test.example.com",
+					RecordType: "A",
+					Targets:    endpoint.Targets{"192.0.2.1"},
+					RecordTTL:  3600,
+				},
+				{
+					DNSName:    "test.other.com",
+					RecordType: "A",
+					Targets:    endpoint.Targets{"192.0.2.2"},
+					RecordTTL:  3600,
+				},
+			},
+			expected: []*endpoint.Endpoint{
+				{
+					DNSName:    "test.example.com",
+					RecordType: "A",
+					Targets:    endpoint.Targets{"192.0.2.1"},
+					RecordTTL:  3600,
+				},
+			},
 		},
 	}
 
-	result, err := client.AdjustEndpoints(endpoints)
-	if err != nil {
-		t.Errorf("AdjustEndpoints in dry run mode returned error: %v", err)
-	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := config.Config{
+				APIToken:      "test-token",
+				DomainFilters: []string{"example.com"},
+				DryRun:        false,
+				DefaultTTL:    3600,
+			}
 
-	// In dry run mode, should return the same endpoints
-	if !reflect.DeepEqual(result, endpoints) {
-		t.Errorf("AdjustEndpoints in dry run mode = %+v, want %+v", result, endpoints)
+			client, err := CreateDesecClient(cfg)
+			if err != nil {
+				t.Fatalf("Failed to create client: %v", err)
+			}
+
+			result, err := client.AdjustEndpoints(tt.endpoints)
+			if err != nil {
+				t.Errorf("AdjustEndpoints returned error: %v", err)
+			}
+
+			if !reflect.DeepEqual(result, tt.expected) {
+				t.Errorf("AdjustEndpoints() = %+v, want %+v", result, tt.expected)
+			}
+		})
 	}
 }
 
