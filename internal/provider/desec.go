@@ -49,64 +49,86 @@ func (d *DesecClient) GetRecords(domain string) ([]desec.RRSet, error) {
 	return d.client.Records.GetAll(d.ctx, domain, nil)
 }
 
+// GetEndpoints fetches all RRSets for a domain and converts them to external-dns Endpoints.
+func (d *DesecClient) GetEndpoints(domain string) ([]*endpoint.Endpoint, error) {
+	log.Debugf("fetching records for domain %s", domain)
+	rrsets, err := d.client.Records.GetAll(d.ctx, domain, nil)
+	if err != nil {
+		return nil, err
+	}
+	log.Debugf("fetched %d rrsets for domain %s", len(rrsets), domain)
+
+	endpoints := make([]*endpoint.Endpoint, 0, len(rrsets))
+	for _, rrset := range rrsets {
+		ep := convertRRSetToEndpoint(&rrset, domain)
+		log.Debugf("converted rrset %s/%s -> endpoint %s/%s (targets: %v, ttl: %d)",
+			rrset.SubName, rrset.Type, ep.DNSName, ep.RecordType, ep.Targets, ep.RecordTTL)
+		endpoints = append(endpoints, ep)
+	}
+	return endpoints, nil
+}
+
 func (d *DesecClient) ApplyChanges(changes plan.Changes) error {
+	log.Debugf("applying changes: %d creates, %d updates, %d deletes",
+		len(changes.Create), len(changes.UpdateNew), len(changes.Delete))
+
 	// Create new records
 	for domain, endpoints := range d.mapEndpointsByHostname(changes.Create) {
 		var toCreate []desec.RRSet
-		// Convert endpoint from external-dns to desec.RRSet
 		for _, endpoint := range endpoints {
 			toCreate = append(toCreate, *convertEndpointToRRSet(endpoint, domain, d.defaultTTL))
 		}
 
 		if d.dryRun {
-			log.Infof("dryrun: at this point, the following records would be created: %v", toCreate)
+			log.Infof("dryrun: would create %d records for domain %s: %v", len(toCreate), domain, toCreate)
 		} else {
-			// Create the records in desec
+			log.Debugf("creating %d records for domain %s: %v", len(toCreate), domain, toCreate)
 			_, err := d.client.Records.BulkCreate(d.ctx, domain, toCreate)
 			if err != nil {
 				log.Errorf("failed to create records for domain %s: %v, payload: %v", domain, err, toCreate)
 				return err
 			}
+			log.Debugf("successfully created %d records for domain %s", len(toCreate), domain)
 		}
 	}
 
 	// Update existing records
 	for domain, endpoints := range d.mapEndpointsByHostname(changes.UpdateNew) {
 		var toUpdate []desec.RRSet
-		// Convert endpoint from external-dns to desec.RRSet
 		for _, endpoint := range endpoints {
 			toUpdate = append(toUpdate, *convertEndpointToRRSet(endpoint, domain, d.defaultTTL))
 		}
 
 		if d.dryRun {
-			log.Infof("dryrun: at this point, the following records would be updated: %v", toUpdate)
+			log.Infof("dryrun: would update %d records for domain %s: %v", len(toUpdate), domain, toUpdate)
 		} else {
-			// Update records in desec with bulk ops
+			log.Debugf("updating %d records for domain %s: %v", len(toUpdate), domain, toUpdate)
 			_, err := d.client.Records.BulkUpdate(d.ctx, desec.FullResource, domain, toUpdate)
 			if err != nil {
 				log.Errorf("failed to update records for domain %s: %v, payload: %v", domain, err, toUpdate)
 				return err
 			}
+			log.Debugf("successfully updated %d records for domain %s", len(toUpdate), domain)
 		}
 	}
 
 	// Delete records
 	for domain, endpoints := range d.mapEndpointsByHostname(changes.Delete) {
 		var toDelete []desec.RRSet
-		// Convert endpoint from external-dns to desec.RRSet
 		for _, endpoint := range endpoints {
 			toDelete = append(toDelete, *convertEndpointToRRSet(endpoint, domain, d.defaultTTL))
 		}
 
 		if d.dryRun {
-			log.Infof("dryrun: at this point, the following records would be deleted: %v", toDelete)
+			log.Infof("dryrun: would delete %d records for domain %s: %v", len(toDelete), domain, toDelete)
 		} else {
-			// Delete records in desec with bulk ops
+			log.Debugf("deleting %d records for domain %s: %v", len(toDelete), domain, toDelete)
 			err := d.client.Records.BulkDelete(d.ctx, domain, toDelete)
 			if err != nil {
 				log.Errorf("failed to delete records for domain %s: %v, payload: %v", domain, err, toDelete)
 				return err
 			}
+			log.Debugf("successfully deleted %d records for domain %s", len(toDelete), domain)
 		}
 	}
 
@@ -124,6 +146,7 @@ func (d *DesecClient) AdjustEndpoints(endpoints []*endpoint.Endpoint) ([]*endpoi
 		return []*endpoint.Endpoint{}, nil
 	}
 
+	log.Debugf("adjusting %d endpoints", len(endpoints))
 	adjustedEndpoints := make([]*endpoint.Endpoint, 0, len(endpoints))
 
 	for _, ep := range endpoints {
@@ -150,6 +173,7 @@ func (d *DesecClient) AdjustEndpoints(endpoints []*endpoint.Endpoint) ([]*endpoi
 
 		// Adjust TTL to meet minimum requirement
 		if adjusted.RecordTTL == 0 || int(adjusted.RecordTTL) < minimumTTL {
+			log.Debugf("adjusting TTL for %s/%s: %d -> %d", ep.DNSName, ep.RecordType, ep.RecordTTL, d.defaultTTL)
 			adjusted.RecordTTL = endpoint.TTL(d.defaultTTL)
 		}
 
@@ -159,6 +183,7 @@ func (d *DesecClient) AdjustEndpoints(endpoints []*endpoint.Endpoint) ([]*endpoi
 			rec := target
 			// Ensure CNAME records end with a dot
 			if ep.RecordType == "CNAME" && !strings.HasSuffix(rec, ".") {
+				log.Debugf("appending trailing dot to CNAME target for %s: %s -> %s.", ep.DNSName, rec, rec)
 				rec = rec + "."
 			}
 			adjusted.Targets[i] = rec
@@ -167,6 +192,7 @@ func (d *DesecClient) AdjustEndpoints(endpoints []*endpoint.Endpoint) ([]*endpoi
 		adjustedEndpoints = append(adjustedEndpoints, adjusted)
 	}
 
+	log.Debugf("adjusted %d endpoints (filtered from %d)", len(adjustedEndpoints), len(endpoints))
 	return adjustedEndpoints, nil
 }
 
@@ -201,7 +227,6 @@ func (d *DesecClient) mapEndpointsByHostname(endpoints []*endpoint.Endpoint) map
 		if ep == nil || ep.DNSName == "" {
 			continue
 		}
-		log.Debugf("mapEndpointsByHostname(%s)", ep.DNSName)
 		// Trim any trailing dot before parsing
 		dnsName := strings.TrimSuffix(ep.DNSName, ".")
 
@@ -212,7 +237,12 @@ func (d *DesecClient) mapEndpointsByHostname(endpoints []*endpoint.Endpoint) map
 			continue
 		}
 
+		log.Debugf("mapped endpoint %s/%s -> domain %s", ep.DNSName, ep.RecordType, matchedDomain)
 		result[matchedDomain] = append(result[matchedDomain], ep)
+	}
+
+	for domain, eps := range result {
+		log.Debugf("domain %s: %d endpoints", domain, len(eps))
 	}
 
 	return result
@@ -237,16 +267,17 @@ func convertEndpointToRRSet(ep *endpoint.Endpoint, domain string, defaultTTL int
 		records[i] = rec
 	}
 
-	// Set RecordTTL to default if is empty or less than minimum TTL
+	// Use default TTL if the endpoint's TTL is empty or less than minimum TTL
+	ttl := int(ep.RecordTTL)
 	if ep.RecordTTL == 0 || ep.RecordTTL < minimumTTL {
-		ep.RecordTTL = endpoint.TTL(defaultTTL)
+		ttl = defaultTTL
 	}
 
 	return &desec.RRSet{
 		SubName: subname,
 		Type:    ep.RecordType,
 		Records: records,
-		TTL:     int(ep.RecordTTL),
+		TTL:     ttl,
 	}
 }
 

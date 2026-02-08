@@ -1,8 +1,10 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 
 	"github.com/gorilla/mux"
@@ -71,42 +73,37 @@ func (webhook webhook) negotiateHandler(w http.ResponseWriter, r *http.Request) 
 	var domainFilter endpoint.DomainFilter
 	domainFilter.Filters = webhook.config.DomainFilters
 
-	err := json.NewEncoder(w).Encode(domainFilter)
-	if err != nil {
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(domainFilter); err != nil {
 		log.Errorf("failed to encode domain filter: %v", err)
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
+	_, _ = w.Write(buf.Bytes())
 }
 
 func (webhook webhook) recordsHandler(w http.ResponseWriter, r *http.Request) {
 	endpoints := []*endpoint.Endpoint{}
 
 	for _, domain := range webhook.config.DomainFilters {
-		rrset, err := webhook.desecClient.GetRecords(domain)
-		log.Debugf("getting records for domain %s", domain)
-		log.Debugf("records: %v", rrset)
+		domainEndpoints, err := webhook.desecClient.GetEndpoints(domain)
 		if err != nil {
-			log.Errorf("failed to get records for domain %s: %v ", domain, err.Error())
-			continue
+			log.Errorf("failed to get records for domain %s: %v", domain, err)
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = fmt.Fprintf(w, "failed to get records for domain %s: %v", domain, err)
+			return
 		}
 
-		for _, record := range rrset {
-			endpoints = append(endpoints, &endpoint.Endpoint{
-				DNSName:    record.Name,
-				RecordType: record.Type,
-				Targets:    record.Records,
-				RecordTTL:  endpoint.TTL(record.TTL),
-			})
-		}
+		endpoints = append(endpoints, domainEndpoints...)
 	}
 
-	err := json.NewEncoder(w).Encode(endpoints)
-	if err != nil {
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(endpoints); err != nil {
 		log.Errorf("failed to encode endpoints: %v", err)
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
+	_, _ = w.Write(buf.Bytes())
 }
 
 func (webhook webhook) applyChangesHandler(w http.ResponseWriter, r *http.Request) {
@@ -117,7 +114,6 @@ func (webhook webhook) applyChangesHandler(w http.ResponseWriter, r *http.Reques
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
-	log.Debugf("applying changes: %v", changes)
 
 	err = webhook.desecClient.ApplyChanges(changes)
 	if err != nil {
@@ -126,7 +122,6 @@ func (webhook webhook) applyChangesHandler(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	log.Debugf("updateRecordsHandler: %+v", changes)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -138,19 +133,19 @@ func (webhook webhook) adjustEndpointsHandler(w http.ResponseWriter, r *http.Req
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
-	log.Debugf("adjusting endpoints: %v", adjustedEndpoints)
 
 	endpoints, err := webhook.desecClient.AdjustEndpoints(adjustedEndpoints)
 	if err != nil {
-		log.Errorf("failed to apply changes: %v", err)
+		log.Errorf("failed to adjust endpoints: %v", err)
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
 
-	err = json.NewEncoder(w).Encode(endpoints)
-	if err != nil {
+	var buf bytes.Buffer
+	if err = json.NewEncoder(&buf).Encode(endpoints); err != nil {
 		log.Errorf("failed to encode endpoints: %v", err)
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
+	_, _ = w.Write(buf.Bytes())
 }
