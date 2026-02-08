@@ -32,7 +32,7 @@ func CreateDesecClient(config config.Config) (*DesecClient, error) {
 
 	ctx := context.Background()
 	client := &DesecClient{
-		client:        desec.New(config.APIToken, desec.ClientOptions{}),
+		client:        desec.New(config.APIToken, desec.NewDefaultClientOptions()),
 		ctx:           ctx,
 		dryRun:        config.DryRun,
 		defaultTTL:    config.DefaultTTL,
@@ -64,7 +64,7 @@ func (d *DesecClient) ApplyChanges(changes plan.Changes) error {
 			// Create the records in desec
 			_, err := d.client.Records.BulkCreate(d.ctx, domain, toCreate)
 			if err != nil {
-				log.Error("failed to create records", err)
+				log.Errorf("failed to create records for domain %s: %v, payload: %v", domain, err, toCreate)
 				return err
 			}
 		}
@@ -84,7 +84,7 @@ func (d *DesecClient) ApplyChanges(changes plan.Changes) error {
 			// Update records in desec with bulk ops
 			_, err := d.client.Records.BulkUpdate(d.ctx, desec.FullResource, domain, toUpdate)
 			if err != nil {
-				log.Error("failed to update records", err)
+				log.Errorf("failed to update records for domain %s: %v, payload: %v", domain, err, toUpdate)
 				return err
 			}
 		}
@@ -104,7 +104,7 @@ func (d *DesecClient) ApplyChanges(changes plan.Changes) error {
 			// Delete records in desec with bulk ops
 			err := d.client.Records.BulkDelete(d.ctx, domain, toDelete)
 			if err != nil {
-				log.Error("failed to delete records", err)
+				log.Errorf("failed to delete records for domain %s: %v, payload: %v", domain, err, toDelete)
 				return err
 			}
 		}
