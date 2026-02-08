@@ -65,6 +65,7 @@ func (d *DesecClient) ApplyChanges(changes plan.Changes) error {
 			_, err := d.client.Records.BulkCreate(d.ctx, domain, toCreate)
 			if err != nil {
 				log.Error("failed to create records", err)
+				return err
 			}
 		}
 	}
@@ -84,6 +85,7 @@ func (d *DesecClient) ApplyChanges(changes plan.Changes) error {
 			_, err := d.client.Records.BulkUpdate(d.ctx, desec.FullResource, domain, toUpdate)
 			if err != nil {
 				log.Error("failed to update records", err)
+				return err
 			}
 		}
 	}
