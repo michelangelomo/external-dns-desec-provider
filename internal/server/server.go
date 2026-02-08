@@ -77,7 +77,6 @@ func (webhook webhook) negotiateHandler(w http.ResponseWriter, r *http.Request) 
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
-	w.WriteHeader(http.StatusOK)
 }
 
 func (webhook webhook) recordsHandler(w http.ResponseWriter, r *http.Request) {
@@ -108,7 +107,6 @@ func (webhook webhook) recordsHandler(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
-	w.WriteHeader(http.StatusOK)
 }
 
 func (webhook webhook) applyChangesHandler(w http.ResponseWriter, r *http.Request) {
@@ -155,5 +153,4 @@ func (webhook webhook) adjustEndpointsHandler(w http.ResponseWriter, r *http.Req
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
-	w.WriteHeader(http.StatusOK)
 }
