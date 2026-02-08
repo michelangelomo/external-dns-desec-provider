@@ -32,7 +32,7 @@ func CreateDesecClient(config config.Config) (*DesecClient, error) {
 
 	ctx := context.Background()
 	client := &DesecClient{
-		client:        desec.New(config.APIToken, desec.NewDefaultClientOptions()),
+		client:        desec.New(config.APIToken, desec.ClientOptions{RetryMax: 2}),
 		ctx:           ctx,
 		dryRun:        config.DryRun,
 		defaultTTL:    config.DefaultTTL,
