@@ -5,11 +5,11 @@ ARG VERSION="v0.0.0-dev"
 
 WORKDIR /app
 COPY . .
-RUN go mod tidy
+RUN go mod download
 RUN CGO_ENABLED=0 GOOS=linux go build -ldflags "-X 'main.Version=${VERSION}'" -o webhook cmd/webhook.go
 
 # Final stage
-FROM alpine:3.18
+FROM alpine:3.21
 
 ARG USER=1000
 RUN adduser -D $USER

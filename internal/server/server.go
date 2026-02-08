@@ -70,8 +70,7 @@ func externalDnsContentTypeMiddleware(next http.Handler) http.Handler {
 }
 
 func (webhook webhook) negotiateHandler(w http.ResponseWriter, r *http.Request) {
-	var domainFilter endpoint.DomainFilter
-	domainFilter.Filters = webhook.config.DomainFilters
+	domainFilter := endpoint.NewDomainFilter(webhook.config.DomainFilters)
 
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(domainFilter); err != nil {
