@@ -16,6 +16,20 @@ func newTestClient(t *testing.T, handler http.HandlerFunc) (*Client, *httptest.S
 	return client, server
 }
 
+func mustEncode(t *testing.T, w http.ResponseWriter, v any) {
+	t.Helper()
+	if err := json.NewEncoder(w).Encode(v); err != nil {
+		t.Errorf("failed to encode response: %v", err)
+	}
+}
+
+func mustDecode(t *testing.T, r *http.Request, v any) {
+	t.Helper()
+	if err := json.NewDecoder(r.Body).Decode(v); err != nil {
+		t.Errorf("failed to decode request body: %v", err)
+	}
+}
+
 func TestGetRecords_Success(t *testing.T) {
 	expected := []RRSet{
 		{SubName: "www", Type: "A", Records: []string{"192.0.2.1"}, TTL: 3600},
@@ -30,7 +44,7 @@ func TestGetRecords_Success(t *testing.T) {
 			t.Errorf("unexpected Authorization header: %s", r.Header.Get("Authorization"))
 		}
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(expected)
+		mustEncode(t, w, expected)
 	})
 	defer server.Close()
 
@@ -62,11 +76,11 @@ func TestBulkCreateRecords_Success(t *testing.T) {
 		}
 
 		var received []RRSet
-		json.NewDecoder(r.Body).Decode(&received)
+		mustDecode(t, r, &received)
 
 		w.WriteHeader(http.StatusCreated)
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(received)
+		mustEncode(t, w, received)
 	})
 	defer server.Close()
 
@@ -93,10 +107,10 @@ func TestBulkUpdateRecords_Success(t *testing.T) {
 		}
 
 		var received []RRSet
-		json.NewDecoder(r.Body).Decode(&received)
+		mustDecode(t, r, &received)
 
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(received)
+		mustEncode(t, w, received)
 	})
 	defer server.Close()
 
@@ -153,7 +167,7 @@ func TestRateLimitError_NoRetryAfterHeader(t *testing.T) {
 func TestAPIError_BadRequest(t *testing.T) {
 	client, server := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusBadRequest)
-		w.Write([]byte(`{"detail":"invalid data"}`))
+		_, _ = w.Write([]byte(`{"detail":"invalid data"}`))
 	})
 	defer server.Close()
 
@@ -177,7 +191,7 @@ func TestAPIError_BadRequest(t *testing.T) {
 func TestAPIError_InternalServerError(t *testing.T) {
 	client, server := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
-		w.Write([]byte("internal server error"))
+		_, _ = w.Write([]byte("internal server error"))
 	})
 	defer server.Close()
 
@@ -202,7 +216,7 @@ func TestBulkDeleteRecords_SetsEmptyRecords(t *testing.T) {
 		}
 
 		var received []RRSet
-		json.NewDecoder(r.Body).Decode(&received)
+		mustDecode(t, r, &received)
 
 		for i, rr := range received {
 			if len(rr.Records) != 0 {
@@ -211,7 +225,7 @@ func TestBulkDeleteRecords_SetsEmptyRecords(t *testing.T) {
 		}
 
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(received)
+		mustEncode(t, w, received)
 	})
 	defer server.Close()
 
@@ -231,11 +245,11 @@ func TestRequestURL_Format(t *testing.T) {
 	client, server := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
 		capturedPath = r.URL.Path
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode([]RRSet{})
+		mustEncode(t, w, []RRSet{})
 	})
 	defer server.Close()
 
-	client.GetRecords(context.Background(), "example.com")
+	_, _ = client.GetRecords(context.Background(), "example.com")
 
 	expected := "/domains/example.com/rrsets/"
 	if capturedPath != expected {
