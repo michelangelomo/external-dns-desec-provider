@@ -5,7 +5,7 @@ import (
 	"testing"
 
 	"github.com/michelangelomo/external-dns-desec-provider/internal/config"
-	"github.com/nrdcg/desec"
+	"github.com/michelangelomo/external-dns-desec-provider/internal/desec"
 	"sigs.k8s.io/external-dns/endpoint"
 	"sigs.k8s.io/external-dns/plan"
 )

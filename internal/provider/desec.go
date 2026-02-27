@@ -2,10 +2,11 @@ package provider
 
 import (
 	"context"
+	"errors"
 	"strings"
 
 	"github.com/michelangelomo/external-dns-desec-provider/internal/config"
-	"github.com/nrdcg/desec"
+	"github.com/michelangelomo/external-dns-desec-provider/internal/desec"
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/net/publicsuffix"
 	"sigs.k8s.io/external-dns/endpoint"
@@ -14,7 +15,6 @@ import (
 
 type DesecClient struct {
 	client        *desec.Client
-	ctx           context.Context
 	dryRun        bool
 	defaultTTL    int
 	domainFilters []string
@@ -30,10 +30,8 @@ func CreateDesecClient(config config.Config) (*DesecClient, error) {
 		config.DefaultTTL = minimumTTL
 	}
 
-	ctx := context.Background()
 	client := &DesecClient{
-		client:        desec.New(config.APIToken, desec.ClientOptions{RetryMax: 2}),
-		ctx:           ctx,
+		client:        desec.NewClient(config.APIToken),
 		dryRun:        config.DryRun,
 		defaultTTL:    config.DefaultTTL,
 		domainFilters: config.DomainFilters,
@@ -41,18 +39,10 @@ func CreateDesecClient(config config.Config) (*DesecClient, error) {
 	return client, nil
 }
 
-func (d *DesecClient) GetDomains() ([]desec.Domain, error) {
-	return d.client.Domains.GetAll(d.ctx)
-}
-
-func (d *DesecClient) GetRecords(domain string) ([]desec.RRSet, error) {
-	return d.client.Records.GetAll(d.ctx, domain, nil)
-}
-
 // GetEndpoints fetches all RRSets for a domain and converts them to external-dns Endpoints.
 func (d *DesecClient) GetEndpoints(domain string) ([]*endpoint.Endpoint, error) {
 	log.Debugf("fetching records for domain %s", domain)
-	rrsets, err := d.client.Records.GetAll(d.ctx, domain, nil)
+	rrsets, err := d.client.GetRecords(context.Background(), domain)
 	if err != nil {
 		return nil, err
 	}
@@ -72,6 +62,8 @@ func (d *DesecClient) ApplyChanges(changes plan.Changes) error {
 	log.Debugf("applying changes: %d creates, %d updates, %d deletes",
 		len(changes.Create), len(changes.UpdateNew), len(changes.Delete))
 
+	var errs []error
+
 	// Create new records
 	for domain, endpoints := range d.mapEndpointsByHostname(changes.Create) {
 		var toCreate []desec.RRSet
@@ -83,10 +75,11 @@ func (d *DesecClient) ApplyChanges(changes plan.Changes) error {
 			log.Infof("dryrun: would create %d records for domain %s: %v", len(toCreate), domain, toCreate)
 		} else {
 			log.Debugf("creating %d records for domain %s: %v", len(toCreate), domain, toCreate)
-			_, err := d.client.Records.BulkCreate(d.ctx, domain, toCreate)
+			_, err := d.client.BulkCreateRecords(context.Background(), domain, toCreate)
 			if err != nil {
-				log.Errorf("failed to create records for domain %s: %v, payload: %v", domain, err, toCreate)
-				return err
+				logDomainError(domain, "create", err)
+				errs = append(errs, err)
+				continue
 			}
 			log.Debugf("successfully created %d records for domain %s", len(toCreate), domain)
 		}
@@ -103,10 +96,11 @@ func (d *DesecClient) ApplyChanges(changes plan.Changes) error {
 			log.Infof("dryrun: would update %d records for domain %s: %v", len(toUpdate), domain, toUpdate)
 		} else {
 			log.Debugf("updating %d records for domain %s: %v", len(toUpdate), domain, toUpdate)
-			_, err := d.client.Records.BulkUpdate(d.ctx, desec.FullResource, domain, toUpdate)
+			_, err := d.client.BulkUpdateRecords(context.Background(), domain, toUpdate)
 			if err != nil {
-				log.Errorf("failed to update records for domain %s: %v, payload: %v", domain, err, toUpdate)
-				return err
+				logDomainError(domain, "update", err)
+				errs = append(errs, err)
+				continue
 			}
 			log.Debugf("successfully updated %d records for domain %s", len(toUpdate), domain)
 		}
@@ -123,16 +117,27 @@ func (d *DesecClient) ApplyChanges(changes plan.Changes) error {
 			log.Infof("dryrun: would delete %d records for domain %s: %v", len(toDelete), domain, toDelete)
 		} else {
 			log.Debugf("deleting %d records for domain %s: %v", len(toDelete), domain, toDelete)
-			err := d.client.Records.BulkDelete(d.ctx, domain, toDelete)
+			err := d.client.BulkDeleteRecords(context.Background(), domain, toDelete)
 			if err != nil {
-				log.Errorf("failed to delete records for domain %s: %v, payload: %v", domain, err, toDelete)
-				return err
+				logDomainError(domain, "delete", err)
+				errs = append(errs, err)
+				continue
 			}
 			log.Debugf("successfully deleted %d records for domain %s", len(toDelete), domain)
 		}
 	}
 
-	return nil
+	return errors.Join(errs...)
+}
+
+// logDomainError logs an error for a domain operation, using Warn for rate limits and Error for other errors.
+func logDomainError(domain, operation string, err error) {
+	var rle *desec.RateLimitError
+	if errors.As(err, &rle) {
+		log.Warnf("rate limited while %s records for domain %s: retry after %d seconds", operation, domain, rle.RetryAfter)
+	} else {
+		log.Errorf("failed to %s records for domain %s: %v", operation, domain, err)
+	}
 }
 
 // AdjustEndpoints adjusts endpoints to be compatible with deSEC requirements.
@@ -334,18 +339,3 @@ func extractDomainAndSubname(fqdn string) (domain, subname string, err error) {
 	subname = strings.TrimSuffix(fqdn, "."+domain)
 	return domain, subname, nil
 }
-
-// extractDomainAndSubname splits a DNS name into domain and subname.
-// Example: "www.example.com" -> domain: "example.com", subname: "www"
-// func extractDomainAndSubname2(fqdn string) (domain string, subname string) {
-//	parts := strings.Split(fqdn, ".")
-//	if len(parts) < 2 {
-//		// fallback for invalid names
-//		return fqdn, ""
-//	}
-//	domain = strings.Join(parts[len(parts)-2:], ".")
-//	if len(parts) > 2 {
-//		subname = strings.Join(parts[:len(parts)-2], ".")
-//	}
-//	return
-//}
