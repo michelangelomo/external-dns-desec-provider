@@ -2,7 +2,9 @@ package provider
 
 import (
 	"context"
+	"net/http"
 	"strings"
+	"time"
 
 	"github.com/michelangelomo/external-dns-desec-provider/internal/config"
 	"github.com/nrdcg/desec"
@@ -18,6 +20,7 @@ type DesecClient struct {
 	dryRun        bool
 	defaultTTL    int
 	domainFilters []string
+	rateLimit     *rateLimitTracker
 }
 
 const (
@@ -30,13 +33,26 @@ func CreateDesecClient(config config.Config) (*DesecClient, error) {
 		config.DefaultTTL = minimumTTL
 	}
 
+	tracker := newRateLimitTracker()
+	httpClient := &http.Client{
+		Timeout: 10 * time.Second,
+		Transport: &rateLimitTransport{
+			inner:   http.DefaultTransport,
+			tracker: tracker,
+		},
+	}
+
 	ctx := context.Background()
 	client := &DesecClient{
-		client:        desec.New(config.APIToken, desec.ClientOptions{RetryMax: 2}),
+		client: desec.New(config.APIToken, desec.ClientOptions{
+			RetryMax:   2,
+			HTTPClient: httpClient,
+		}),
 		ctx:           ctx,
 		dryRun:        config.DryRun,
 		defaultTTL:    config.DefaultTTL,
 		domainFilters: config.DomainFilters,
+		rateLimit:     tracker,
 	}
 	return client, nil
 }
@@ -69,6 +85,11 @@ func (d *DesecClient) GetEndpoints(domain string) ([]*endpoint.Endpoint, error) 
 }
 
 func (d *DesecClient) ApplyChanges(changes plan.Changes) error {
+	if remaining := d.rateLimit.wait(); remaining > 0 {
+		log.Warnf("deSEC rate limit active; skipping ApplyChanges for %s to preserve daily quota", remaining)
+		return &RateLimitError{RetryAfter: remaining}
+	}
+
 	log.Debugf("applying changes: %d creates, %d updates, %d deletes",
 		len(changes.Create), len(changes.UpdateNew), len(changes.Delete))
 
@@ -287,14 +308,19 @@ func convertRRSetToEndpoint(rrset *desec.RRSet, domain string) *endpoint.Endpoin
 		return nil
 	}
 
-	// Compose DNSName from subname and domain
+	// Compose DNSName from subname and domain. external-dns sources emit
+	// DNSName without a trailing dot, and external-dns's TXT registry
+	// matches companion records by exact-string DNSName -- if /records
+	// returns a dotted form, the registry sets providerSpecific
+	// txt/force-update=true on every reconcile and the plan calculator
+	// emits a no-op Update for every record.
 	var dnsName string
 	if rrset.SubName == "" {
 		dnsName = domain
 	} else {
 		dnsName = rrset.SubName + "." + domain
 	}
-	dnsName = strings.TrimSuffix(dnsName, ".") + "."
+	dnsName = strings.TrimSuffix(dnsName, ".")
 
 	targets := make(endpoint.Targets, len(rrset.Records))
 	copy(targets, rrset.Records)

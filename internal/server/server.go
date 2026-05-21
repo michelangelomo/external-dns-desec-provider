@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 
 	"github.com/gorilla/mux"
@@ -106,6 +107,11 @@ func (webhook webhook) recordsHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func (webhook webhook) applyChangesHandler(w http.ResponseWriter, r *http.Request) {
+	if err := dumpRequestBodyAtDebug(r, "/records"); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+
 	var changes plan.Changes
 
 	err := json.NewDecoder(r.Body).Decode(&changes)
@@ -125,6 +131,11 @@ func (webhook webhook) applyChangesHandler(w http.ResponseWriter, r *http.Reques
 }
 
 func (webhook webhook) adjustEndpointsHandler(w http.ResponseWriter, r *http.Request) {
+	if err := dumpRequestBodyAtDebug(r, "/adjustendpoints"); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+
 	adjustedEndpoints := []*endpoint.Endpoint{}
 
 	err := json.NewDecoder(r.Body).Decode(&adjustedEndpoints)
@@ -147,4 +158,24 @@ func (webhook webhook) adjustEndpointsHandler(w http.ResponseWriter, r *http.Req
 		return
 	}
 	_, _ = w.Write(buf.Bytes())
+}
+
+// dumpRequestBodyAtDebug logs the full request body when debug-level logging
+// is enabled, then rewinds r.Body so the handler can decode it normally.
+// Used to capture the full plan.Changes payload (including UpdateOld, Labels,
+// and ProviderSpecific) that the summary log lines do not show. The body
+// read is skipped entirely at info level so production deployments pay no
+// extra cost; enable with WEBHOOK_LOGLEVEL=debug.
+func dumpRequestBodyAtDebug(r *http.Request, label string) error {
+	if !log.IsLevelEnabled(log.DebugLevel) {
+		return nil
+	}
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		log.Errorf("failed to read %s body for debug log: %v", label, err)
+		return err
+	}
+	log.Debugf("POST %s body: %s", label, string(body))
+	r.Body = io.NopCloser(bytes.NewReader(body))
+	return nil
 }

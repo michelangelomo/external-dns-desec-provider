@@ -476,7 +476,7 @@ func TestConvertRRSetToEndpointExtended(t *testing.T) {
 			},
 			domain: "example.com",
 			expected: &endpoint.Endpoint{
-				DNSName:    "www.example.com.",
+				DNSName:    "www.example.com",
 				RecordType: "A",
 				Targets:    endpoint.Targets{"192.0.2.1", "192.0.2.2"},
 				RecordTTL:  300,
@@ -492,14 +492,14 @@ func TestConvertRRSetToEndpointExtended(t *testing.T) {
 			},
 			domain: "example.com",
 			expected: &endpoint.Endpoint{
-				DNSName:    "_dmarc.example.com.",
+				DNSName:    "_dmarc.example.com",
 				RecordType: "TXT",
 				Targets:    endpoint.Targets{"v=DMARC1; p=reject"},
 				RecordTTL:  3600,
 			},
 		},
 		{
-			name: "Domain with trailing dot",
+			name: "Apex record with dotted domain still emits dotless DNSName",
 			input: &desec.RRSet{
 				SubName: "",
 				Type:    "A",
@@ -508,7 +508,7 @@ func TestConvertRRSetToEndpointExtended(t *testing.T) {
 			},
 			domain: "example.com.",
 			expected: &endpoint.Endpoint{
-				DNSName:    "example.com.",
+				DNSName:    "example.com",
 				RecordType: "A",
 				Targets:    endpoint.Targets{"192.0.2.1"},
 				RecordTTL:  300,
@@ -782,6 +782,40 @@ func TestAdjustEndpoints(t *testing.T) {
 
 			if !reflect.DeepEqual(result, tt.expected) {
 				t.Errorf("AdjustEndpoints() = %+v, want %+v", result, tt.expected)
+			}
+		})
+	}
+}
+
+// TestConvertRRSetToEndpoint_DNSNameHasNoTrailingDot pins the read-path
+// invariant that prevents the providerSpecific txt/force-update=true loop:
+// external-dns sources emit DNSName without a trailing dot, and the TXT
+// registry matches companion records by exact-string DNSName. If /records
+// returns a dotted form, every reconcile produces a no-op Update on every
+// record (observed in deploy as "0 creates, 10 updates, 0 deletes").
+func TestConvertRRSetToEndpoint_DNSNameHasNoTrailingDot(t *testing.T) {
+	cases := []struct {
+		name    string
+		subname string
+		domain  string
+		want    string
+	}{
+		{"subdomain", "www", "example.com", "www.example.com"},
+		{"apex", "", "example.com", "example.com"},
+		{"deep subdomain", "foo.bar", "example.com", "foo.bar.example.com"},
+		{"domain passed with trailing dot still strips", "www", "example.com.", "www.example.com"},
+		{"apex with domain trailing dot still strips", "", "example.com.", "example.com"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ep := convertRRSetToEndpoint(&desec.RRSet{
+				SubName: tc.subname,
+				Type:    "A",
+				Records: []string{"192.0.2.1"},
+				TTL:     3600,
+			}, tc.domain)
+			if ep.DNSName != tc.want {
+				t.Errorf("DNSName = %q, want %q", ep.DNSName, tc.want)
 			}
 		})
 	}

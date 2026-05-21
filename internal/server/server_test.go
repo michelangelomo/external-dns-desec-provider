@@ -367,6 +367,87 @@ func TestWebhookServerShutdown(t *testing.T) {
 	}
 }
 
+// TestApplyChangesHandler_DebugBodyDump verifies that with debug logging on,
+// the raw request body is written to the log so an operator can inspect
+// UpdateOld and other plan.Changes fields the summary log lines omit.
+func TestApplyChangesHandler_DebugBodyDump(t *testing.T) {
+	webhook := createTestWebhook()
+
+	body, err := json.Marshal(plan.Changes{
+		UpdateNew: []*endpoint.Endpoint{
+			{DNSName: "diag.example.com", RecordType: "TXT", Targets: endpoint.Targets{`"heritage=external-dns"`}, RecordTTL: 3600},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Failed to marshal changes: %v", err)
+	}
+
+	var buf bytes.Buffer
+	prevLevel := log.GetLevel()
+	prevOut := log.StandardLogger().Out
+	log.SetLevel(log.DebugLevel)
+	log.SetOutput(&buf)
+	defer func() {
+		log.SetLevel(prevLevel)
+		log.SetOutput(prevOut)
+	}()
+
+	req := httptest.NewRequest("POST", "/records", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	webhook.applyChangesHandler(w, req)
+
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("Status code = %v, want %v (logs: %s)", w.Code, http.StatusNoContent, buf.String())
+	}
+	if !bytes.Contains(buf.Bytes(), []byte("POST /records body:")) {
+		t.Errorf("expected debug log to contain body dump prefix, got: %s", buf.String())
+	}
+	if !bytes.Contains(buf.Bytes(), []byte("diag.example.com")) {
+		t.Errorf("expected debug log to contain the request body, got: %s", buf.String())
+	}
+}
+
+// TestApplyChangesHandler_NoDebugDumpAtInfoLevel verifies that at info level
+// (the default) the handler does not log the body and still serves the
+// request correctly -- so the diagnostic flag is opt-in.
+func TestApplyChangesHandler_NoDebugDumpAtInfoLevel(t *testing.T) {
+	webhook := createTestWebhook()
+
+	body, err := json.Marshal(plan.Changes{
+		Create: []*endpoint.Endpoint{
+			{DNSName: "quiet.example.com", RecordType: "A", Targets: endpoint.Targets{"192.0.2.1"}, RecordTTL: 3600},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Failed to marshal changes: %v", err)
+	}
+
+	var buf bytes.Buffer
+	prevLevel := log.GetLevel()
+	prevOut := log.StandardLogger().Out
+	log.SetLevel(log.InfoLevel)
+	log.SetOutput(&buf)
+	defer func() {
+		log.SetLevel(prevLevel)
+		log.SetOutput(prevOut)
+	}()
+
+	req := httptest.NewRequest("POST", "/records", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	webhook.applyChangesHandler(w, req)
+
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("Status code = %v, want %v", w.Code, http.StatusNoContent)
+	}
+	if bytes.Contains(buf.Bytes(), []byte("POST /records body:")) {
+		t.Errorf("info level should not emit body dump; got: %s", buf.String())
+	}
+}
+
 // Integration test with HTTP server
 func TestWebhookServerIntegration(t *testing.T) {
 	config := config.Config{
