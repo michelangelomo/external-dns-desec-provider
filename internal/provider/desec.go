@@ -2,7 +2,9 @@ package provider
 
 import (
 	"context"
+	"net/http"
 	"strings"
+	"time"
 
 	"github.com/michelangelomo/external-dns-desec-provider/internal/config"
 	"github.com/nrdcg/desec"
@@ -18,6 +20,7 @@ type DesecClient struct {
 	dryRun        bool
 	defaultTTL    int
 	domainFilters []string
+	rateLimit     *rateLimitTracker
 }
 
 const (
@@ -30,13 +33,26 @@ func CreateDesecClient(config config.Config) (*DesecClient, error) {
 		config.DefaultTTL = minimumTTL
 	}
 
+	tracker := newRateLimitTracker()
+	httpClient := &http.Client{
+		Timeout: 10 * time.Second,
+		Transport: &rateLimitTransport{
+			inner:   http.DefaultTransport,
+			tracker: tracker,
+		},
+	}
+
 	ctx := context.Background()
 	client := &DesecClient{
-		client:        desec.New(config.APIToken, desec.ClientOptions{RetryMax: 2}),
+		client: desec.New(config.APIToken, desec.ClientOptions{
+			RetryMax:   2,
+			HTTPClient: httpClient,
+		}),
 		ctx:           ctx,
 		dryRun:        config.DryRun,
 		defaultTTL:    config.DefaultTTL,
 		domainFilters: config.DomainFilters,
+		rateLimit:     tracker,
 	}
 	return client, nil
 }
@@ -69,67 +85,83 @@ func (d *DesecClient) GetEndpoints(domain string) ([]*endpoint.Endpoint, error) 
 }
 
 func (d *DesecClient) ApplyChanges(changes plan.Changes) error {
+	if remaining := d.rateLimit.wait(); remaining > 0 {
+		log.Warnf("deSEC rate limit active; skipping ApplyChanges for %s to preserve daily quota", remaining)
+		return &RateLimitError{RetryAfter: remaining}
+	}
+
 	log.Debugf("applying changes: %d creates, %d updates, %d deletes",
 		len(changes.Create), len(changes.UpdateNew), len(changes.Delete))
 
-	// Create new records
+	// deSEC bulk operations are atomic and validate the *resulting* zone
+	// state, so we merge creates, updates, and deletes for each domain into a
+	// single PUT (desec.FullResource). This avoids the non-atomic Create-then-
+	// Delete ordering that breaks record-type changes: a retype reaches us as
+	// Delete(old A) + Create(new CNAME) at the same subname, and posting the
+	// CNAME while the A still exists is rejected by deSEC (CNAME may not
+	// coexist with other types). Encoding the deletion as records:[] in the
+	// same request lets deSEC validate the final state (A gone, CNAME present)
+	// and accept it. BulkUpdate(FullResource, ...) only touches the rrsets in
+	// the request, so unrelated records are untouched.
+	type bulkChanges struct {
+		create    []desec.RRSet
+		updateNew []desec.RRSet
+		delete    []desec.RRSet
+	}
+	merged := make(map[string]*bulkChanges)
+
+	get := func(domain string) *bulkChanges {
+		bc := merged[domain]
+		if bc == nil {
+			bc = &bulkChanges{}
+			merged[domain] = bc
+		}
+		return bc
+	}
+
 	for domain, endpoints := range d.mapEndpointsByHostname(changes.Create) {
-		var toCreate []desec.RRSet
-		for _, endpoint := range endpoints {
-			toCreate = append(toCreate, *convertEndpointToRRSet(endpoint, domain, d.defaultTTL))
-		}
-
-		if d.dryRun {
-			log.Infof("dryrun: would create %d records for domain %s: %v", len(toCreate), domain, toCreate)
-		} else {
-			log.Debugf("creating %d records for domain %s: %v", len(toCreate), domain, toCreate)
-			_, err := d.client.Records.BulkCreate(d.ctx, domain, toCreate)
-			if err != nil {
-				log.Errorf("failed to create records for domain %s: %v, payload: %v", domain, err, toCreate)
-				return err
-			}
-			log.Debugf("successfully created %d records for domain %s", len(toCreate), domain)
+		bc := get(domain)
+		for _, ep := range endpoints {
+			bc.create = append(bc.create, *convertEndpointToRRSet(ep, domain, d.defaultTTL))
 		}
 	}
-
-	// Update existing records
 	for domain, endpoints := range d.mapEndpointsByHostname(changes.UpdateNew) {
-		var toUpdate []desec.RRSet
-		for _, endpoint := range endpoints {
-			toUpdate = append(toUpdate, *convertEndpointToRRSet(endpoint, domain, d.defaultTTL))
+		bc := get(domain)
+		for _, ep := range endpoints {
+			bc.updateNew = append(bc.updateNew, *convertEndpointToRRSet(ep, domain, d.defaultTTL))
 		}
-
-		if d.dryRun {
-			log.Infof("dryrun: would update %d records for domain %s: %v", len(toUpdate), domain, toUpdate)
-		} else {
-			log.Debugf("updating %d records for domain %s: %v", len(toUpdate), domain, toUpdate)
-			_, err := d.client.Records.BulkUpdate(d.ctx, desec.FullResource, domain, toUpdate)
-			if err != nil {
-				log.Errorf("failed to update records for domain %s: %v, payload: %v", domain, err, toUpdate)
-				return err
-			}
-			log.Debugf("successfully updated %d records for domain %s", len(toUpdate), domain)
+	}
+	for domain, endpoints := range d.mapEndpointsByHostname(changes.Delete) {
+		bc := get(domain)
+		for _, ep := range endpoints {
+			rrset := *convertEndpointToRRSet(ep, domain, d.defaultTTL)
+			// Encode deletion as an empty record set so the bulk PUT removes
+			// it while validating the final zone state.
+			rrset.Records = []string{}
+			bc.delete = append(bc.delete, rrset)
 		}
 	}
 
-	// Delete records
-	for domain, endpoints := range d.mapEndpointsByHostname(changes.Delete) {
-		var toDelete []desec.RRSet
-		for _, endpoint := range endpoints {
-			toDelete = append(toDelete, *convertEndpointToRRSet(endpoint, domain, d.defaultTTL))
-		}
+	for domain, bc := range merged {
+		toApply := make([]desec.RRSet, 0, len(bc.create)+len(bc.updateNew)+len(bc.delete))
+		toApply = append(toApply, bc.create...)
+		toApply = append(toApply, bc.updateNew...)
+		toApply = append(toApply, bc.delete...)
 
 		if d.dryRun {
-			log.Infof("dryrun: would delete %d records for domain %s: %v", len(toDelete), domain, toDelete)
-		} else {
-			log.Debugf("deleting %d records for domain %s: %v", len(toDelete), domain, toDelete)
-			err := d.client.Records.BulkDelete(d.ctx, domain, toDelete)
-			if err != nil {
-				log.Errorf("failed to delete records for domain %s: %v, payload: %v", domain, err, toDelete)
-				return err
-			}
-			log.Debugf("successfully deleted %d records for domain %s", len(toDelete), domain)
+			log.Infof("dryrun: would apply %d changes for domain %s (%d create, %d update, %d delete): %v",
+				len(toApply), domain, len(bc.create), len(bc.updateNew), len(bc.delete), toApply)
+			continue
 		}
+
+		log.Debugf("applying %d changes for domain %s (%d create, %d update, %d delete): %v",
+			len(toApply), domain, len(bc.create), len(bc.updateNew), len(bc.delete), toApply)
+		_, err := d.client.Records.BulkUpdate(d.ctx, desec.FullResource, domain, toApply)
+		if err != nil {
+			log.Errorf("failed to apply changes for domain %s: %v, payload: %v", domain, err, toApply)
+			return err
+		}
+		log.Debugf("successfully applied %d changes for domain %s", len(toApply), domain)
 	}
 
 	return nil
@@ -287,14 +319,19 @@ func convertRRSetToEndpoint(rrset *desec.RRSet, domain string) *endpoint.Endpoin
 		return nil
 	}
 
-	// Compose DNSName from subname and domain
+	// Compose DNSName from subname and domain. external-dns sources emit
+	// DNSName without a trailing dot, and external-dns's TXT registry
+	// matches companion records by exact-string DNSName -- if /records
+	// returns a dotted form, the registry sets providerSpecific
+	// txt/force-update=true on every reconcile and the plan calculator
+	// emits a no-op Update for every record.
 	var dnsName string
 	if rrset.SubName == "" {
 		dnsName = domain
 	} else {
 		dnsName = rrset.SubName + "." + domain
 	}
-	dnsName = strings.TrimSuffix(dnsName, ".") + "."
+	dnsName = strings.TrimSuffix(dnsName, ".")
 
 	targets := make(endpoint.Targets, len(rrset.Records))
 	copy(targets, rrset.Records)
