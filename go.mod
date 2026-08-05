@@ -5,7 +5,7 @@ go 1.25
 require (
 	github.com/gorilla/mux v1.8.1
 	github.com/kelseyhightower/envconfig v1.4.0
-	github.com/nrdcg/desec v0.11.1
+	github.com/nrdcg/desec v0.11.2
 	github.com/sirupsen/logrus v1.9.4
 	golang.org/x/net v0.49.0
 	sigs.k8s.io/external-dns v0.20.0

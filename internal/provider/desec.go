@@ -2,7 +2,11 @@ package provider
 
 import (
 	"context"
+	"fmt"
+	"net/http"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/michelangelomo/external-dns-desec-provider/internal/config"
 	"github.com/nrdcg/desec"
@@ -14,15 +18,50 @@ import (
 
 type DesecClient struct {
 	client        *desec.Client
-	ctx           context.Context
 	dryRun        bool
 	defaultTTL    int
 	domainFilters []string
+	rateLimit     *rateLimitTracker
+
+	cacheMu sync.Mutex
+	cache   map[string]cachedEndpoints
+}
+
+type cachedEndpoints struct {
+	endpoints []*endpoint.Endpoint
+	fetchedAt time.Time
 }
 
 const (
 	minimumTTL = 3600 // Minimum TTL for desec is 3600 seconds
+
+	// maxCacheStaleness caps how old a last-known-good record set may be before
+	// it is no longer served during a throttle window. Past it we prefer a 500
+	// (retried next interval) over feeding external-dns a stale zone under
+	// --policy=sync, which could delete records that in fact still exist.
+	maxCacheStaleness = 24 * time.Hour
 )
+
+// retryableLogger adapts logrus to retryablehttp.LeveledLogger so the retry
+// client's status codes and wait durations surface in the app's log stream.
+type retryableLogger struct{}
+
+func (retryableLogger) Error(msg string, kv ...any) { log.WithFields(kvFields(kv)).Error(msg) }
+func (retryableLogger) Warn(msg string, kv ...any)  { log.WithFields(kvFields(kv)).Warn(msg) }
+func (retryableLogger) Info(msg string, kv ...any)  { log.WithFields(kvFields(kv)).Info(msg) }
+func (retryableLogger) Debug(msg string, kv ...any) { log.WithFields(kvFields(kv)).Debug(msg) }
+
+func kvFields(kv []any) log.Fields {
+	fields := log.Fields{}
+	for i := 0; i+1 < len(kv); i += 2 {
+		key, ok := kv[i].(string)
+		if !ok {
+			key = fmt.Sprintf("%v", kv[i])
+		}
+		fields[key] = kv[i+1]
+	}
+	return fields
+}
 
 func CreateDesecClient(config config.Config) (*DesecClient, error) {
 	if config.DefaultTTL < minimumTTL {
@@ -30,33 +69,66 @@ func CreateDesecClient(config config.Config) (*DesecClient, error) {
 		config.DefaultTTL = minimumTTL
 	}
 
-	ctx := context.Background()
+	tracker := newRateLimitTracker()
+	httpClient := &http.Client{
+		Timeout: 10 * time.Second,
+		Transport: &rateLimitTransport{
+			inner:     http.DefaultTransport,
+			tracker:   tracker,
+			proactive: newProactiveLimiter(tracker.now),
+		},
+	}
+
 	client := &DesecClient{
-		client:        desec.New(config.APIToken, desec.ClientOptions{RetryMax: 2}),
-		ctx:           ctx,
+		client: desec.New(config.APIToken, desec.ClientOptions{
+			RetryMax:   2,
+			HTTPClient: httpClient,
+			// Without a logger retryablehttp swallows the 429 and its retry
+			// wait, which is how the ~12.5h sleep was invisible in the logs.
+			Logger: retryableLogger{},
+		}),
 		dryRun:        config.DryRun,
 		defaultTTL:    config.DefaultTTL,
 		domainFilters: config.DomainFilters,
+		rateLimit:     tracker,
+		cache:         make(map[string]cachedEndpoints),
 	}
 	return client, nil
 }
 
-func (d *DesecClient) GetDomains() ([]desec.Domain, error) {
-	return d.client.Domains.GetAll(d.ctx)
+func (d *DesecClient) GetDomains(ctx context.Context) ([]desec.Domain, error) {
+	return d.client.Domains.GetAll(ctx)
 }
 
-func (d *DesecClient) GetRecords(domain string) ([]desec.RRSet, error) {
-	return d.client.Records.GetAll(d.ctx, domain, nil)
+// checkThrottle returns a *RateLimitError while a throttle window observed from
+// a prior 429 is still open, so a call can skip the API entirely: hitting deSEC
+// again would only burn more of the daily quota and return another long
+// Retry-After. op names the skipped operation for the log line.
+func (d *DesecClient) checkThrottle(op string) *RateLimitError {
+	remaining := d.rateLimit.wait()
+	if remaining <= 0 {
+		return nil
+	}
+	log.Warnf("deSEC rate limit active; skipping %s (retry after %s)", op, remaining)
+	return &RateLimitError{RetryAfter: remaining}
 }
 
 // GetEndpoints fetches all RRSets for a domain and converts them to external-dns Endpoints.
-func (d *DesecClient) GetEndpoints(domain string) ([]*endpoint.Endpoint, error) {
-	log.Debugf("fetching records for domain %s", domain)
-	rrsets, err := d.client.Records.GetAll(d.ctx, domain, nil)
+// The caller's context is threaded through to the deSEC call so external-dns's
+// webhook read timeout can interrupt a request stuck retrying a 429 -- the
+// deSEC library sleeps the raw Retry-After (up to ~12.5h) between retries and
+// only wakes on ctx cancellation or the timer.
+func (d *DesecClient) GetEndpoints(ctx context.Context, domain string) ([]*endpoint.Endpoint, error) {
+	if rle := d.checkThrottle("/records fetch for " + domain); rle != nil {
+		return nil, rle
+	}
+
+	log.Infof("fetching records for domain %s", domain)
+	rrsets, err := d.client.Records.GetAll(ctx, domain, nil)
 	if err != nil {
 		return nil, err
 	}
-	log.Debugf("fetched %d rrsets for domain %s", len(rrsets), domain)
+	log.Infof("fetched %d rrsets for domain %s", len(rrsets), domain)
 
 	endpoints := make([]*endpoint.Endpoint, 0, len(rrsets))
 	for _, rrset := range rrsets {
@@ -65,71 +137,125 @@ func (d *DesecClient) GetEndpoints(domain string) ([]*endpoint.Endpoint, error) 
 			rrset.SubName, rrset.Type, ep.DNSName, ep.RecordType, ep.Targets, ep.RecordTTL)
 		endpoints = append(endpoints, ep)
 	}
+
+	// Remember this successful fetch as last-known-good so a later throttle
+	// window can be answered from cache instead of a 500.
+	d.cacheMu.Lock()
+	d.cache[domain] = cachedEndpoints{endpoints: endpoints, fetchedAt: d.rateLimit.now()}
+	d.cacheMu.Unlock()
+
 	return endpoints, nil
 }
 
-func (d *DesecClient) ApplyChanges(changes plan.Changes) error {
+// Throttled reports whether a deSEC throttle window observed from a prior 429 is
+// still open. Handlers consult it to decide whether serving stale cached records
+// is warranted.
+func (d *DesecClient) Throttled() bool {
+	return d.rateLimit.wait() > 0
+}
+
+// CachedEndpoints returns last-known-good endpoints for every requested domain,
+// but only all-or-nothing: if any domain has never been fetched successfully or
+// its cache is older than maxCacheStaleness, it returns ok=false. Serving a
+// partial set under --policy=sync would make external-dns recreate the missing
+// domain's records, so a gap must fall through to a 500 instead.
+func (d *DesecClient) CachedEndpoints(domains []string) ([]*endpoint.Endpoint, bool) {
+	d.cacheMu.Lock()
+	defer d.cacheMu.Unlock()
+
+	now := d.rateLimit.now()
+	endpoints := []*endpoint.Endpoint{}
+	for _, domain := range domains {
+		entry, ok := d.cache[domain]
+		if !ok {
+			return nil, false
+		}
+		if now.Sub(entry.fetchedAt) > maxCacheStaleness {
+			log.Warnf("cached records for %s are older than %s; not serving stale zone", domain, maxCacheStaleness)
+			return nil, false
+		}
+		endpoints = append(endpoints, entry.endpoints...)
+	}
+	return endpoints, true
+}
+
+func (d *DesecClient) ApplyChanges(ctx context.Context, changes plan.Changes) error {
+	if rle := d.checkThrottle("ApplyChanges"); rle != nil {
+		return rle
+	}
+
 	log.Debugf("applying changes: %d creates, %d updates, %d deletes",
 		len(changes.Create), len(changes.UpdateNew), len(changes.Delete))
 
-	// Create new records
+	// deSEC bulk operations are atomic and validate the *resulting* zone
+	// state, so we merge creates, updates, and deletes for each domain into a
+	// single PUT (desec.FullResource). This avoids the non-atomic Create-then-
+	// Delete ordering that breaks record-type changes: a retype reaches us as
+	// Delete(old A) + Create(new CNAME) at the same subname, and posting the
+	// CNAME while the A still exists is rejected by deSEC (CNAME may not
+	// coexist with other types). Encoding the deletion as records:[] in the
+	// same request lets deSEC validate the final state (A gone, CNAME present)
+	// and accept it. BulkUpdate(FullResource, ...) only touches the rrsets in
+	// the request, so unrelated records are untouched.
+	type bulkChanges struct {
+		create    []desec.RRSet
+		updateNew []desec.RRSet
+		delete    []desec.RRSet
+	}
+	merged := make(map[string]*bulkChanges)
+
+	get := func(domain string) *bulkChanges {
+		bc := merged[domain]
+		if bc == nil {
+			bc = &bulkChanges{}
+			merged[domain] = bc
+		}
+		return bc
+	}
+
 	for domain, endpoints := range d.mapEndpointsByHostname(changes.Create) {
-		var toCreate []desec.RRSet
-		for _, endpoint := range endpoints {
-			toCreate = append(toCreate, *convertEndpointToRRSet(endpoint, domain, d.defaultTTL))
-		}
-
-		if d.dryRun {
-			log.Infof("dryrun: would create %d records for domain %s: %v", len(toCreate), domain, toCreate)
-		} else {
-			log.Debugf("creating %d records for domain %s: %v", len(toCreate), domain, toCreate)
-			_, err := d.client.Records.BulkCreate(d.ctx, domain, toCreate)
-			if err != nil {
-				log.Errorf("failed to create records for domain %s: %v, payload: %v", domain, err, toCreate)
-				return err
-			}
-			log.Debugf("successfully created %d records for domain %s", len(toCreate), domain)
+		bc := get(domain)
+		for _, ep := range endpoints {
+			bc.create = append(bc.create, *convertEndpointToRRSet(ep, domain, d.defaultTTL))
 		}
 	}
-
-	// Update existing records
 	for domain, endpoints := range d.mapEndpointsByHostname(changes.UpdateNew) {
-		var toUpdate []desec.RRSet
-		for _, endpoint := range endpoints {
-			toUpdate = append(toUpdate, *convertEndpointToRRSet(endpoint, domain, d.defaultTTL))
+		bc := get(domain)
+		for _, ep := range endpoints {
+			bc.updateNew = append(bc.updateNew, *convertEndpointToRRSet(ep, domain, d.defaultTTL))
 		}
-
-		if d.dryRun {
-			log.Infof("dryrun: would update %d records for domain %s: %v", len(toUpdate), domain, toUpdate)
-		} else {
-			log.Debugf("updating %d records for domain %s: %v", len(toUpdate), domain, toUpdate)
-			_, err := d.client.Records.BulkUpdate(d.ctx, desec.FullResource, domain, toUpdate)
-			if err != nil {
-				log.Errorf("failed to update records for domain %s: %v, payload: %v", domain, err, toUpdate)
-				return err
-			}
-			log.Debugf("successfully updated %d records for domain %s", len(toUpdate), domain)
+	}
+	for domain, endpoints := range d.mapEndpointsByHostname(changes.Delete) {
+		bc := get(domain)
+		for _, ep := range endpoints {
+			rrset := *convertEndpointToRRSet(ep, domain, d.defaultTTL)
+			// Encode deletion as an empty record set so the bulk PUT removes
+			// it while validating the final zone state.
+			rrset.Records = []string{}
+			bc.delete = append(bc.delete, rrset)
 		}
 	}
 
-	// Delete records
-	for domain, endpoints := range d.mapEndpointsByHostname(changes.Delete) {
-		var toDelete []desec.RRSet
-		for _, endpoint := range endpoints {
-			toDelete = append(toDelete, *convertEndpointToRRSet(endpoint, domain, d.defaultTTL))
-		}
+	for domain, bc := range merged {
+		toApply := make([]desec.RRSet, 0, len(bc.create)+len(bc.updateNew)+len(bc.delete))
+		toApply = append(toApply, bc.create...)
+		toApply = append(toApply, bc.updateNew...)
+		toApply = append(toApply, bc.delete...)
 
 		if d.dryRun {
-			log.Infof("dryrun: would delete %d records for domain %s: %v", len(toDelete), domain, toDelete)
-		} else {
-			log.Debugf("deleting %d records for domain %s: %v", len(toDelete), domain, toDelete)
-			err := d.client.Records.BulkDelete(d.ctx, domain, toDelete)
-			if err != nil {
-				log.Errorf("failed to delete records for domain %s: %v, payload: %v", domain, err, toDelete)
-				return err
-			}
-			log.Debugf("successfully deleted %d records for domain %s", len(toDelete), domain)
+			log.Infof("dryrun: would apply %d changes for domain %s (%d create, %d update, %d delete): %v",
+				len(toApply), domain, len(bc.create), len(bc.updateNew), len(bc.delete), toApply)
+			continue
 		}
+
+		log.Debugf("applying %d changes for domain %s (%d create, %d update, %d delete): %v",
+			len(toApply), domain, len(bc.create), len(bc.updateNew), len(bc.delete), toApply)
+		_, err := d.client.Records.BulkUpdate(ctx, desec.FullResource, domain, toApply)
+		if err != nil {
+			log.Errorf("failed to apply changes for domain %s: %v, payload: %v", domain, err, toApply)
+			return err
+		}
+		log.Debugf("successfully applied %d changes for domain %s", len(toApply), domain)
 	}
 
 	return nil
@@ -287,14 +413,19 @@ func convertRRSetToEndpoint(rrset *desec.RRSet, domain string) *endpoint.Endpoin
 		return nil
 	}
 
-	// Compose DNSName from subname and domain
+	// Compose DNSName from subname and domain. external-dns sources emit
+	// DNSName without a trailing dot, and external-dns's TXT registry
+	// matches companion records by exact-string DNSName -- if /records
+	// returns a dotted form, the registry sets providerSpecific
+	// txt/force-update=true on every reconcile and the plan calculator
+	// emits a no-op Update for every record.
 	var dnsName string
 	if rrset.SubName == "" {
 		dnsName = domain
 	} else {
 		dnsName = rrset.SubName + "." + domain
 	}
-	dnsName = strings.TrimSuffix(dnsName, ".") + "."
+	dnsName = strings.TrimSuffix(dnsName, ".")
 
 	targets := make(endpoint.Targets, len(rrset.Records))
 	copy(targets, rrset.Records)

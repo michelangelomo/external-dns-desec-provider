@@ -134,6 +134,139 @@ func TestRecordsHandler(t *testing.T) {
 	}
 }
 
+// throttledProvider is a desecProvider that always reports an open deSEC
+// throttle window, so the handler mapping (RateLimitError -> cache or
+// 500 + Retry-After) can be tested without driving a real retry loop. When
+// cached is set, CachedEndpoints returns it all-or-nothing.
+type throttledProvider struct {
+	retryAfter time.Duration
+	cached     []*endpoint.Endpoint
+	hasCache   bool
+}
+
+func (p throttledProvider) GetEndpoints(_ context.Context, _ string) ([]*endpoint.Endpoint, error) {
+	return nil, &provider.RateLimitError{RetryAfter: p.retryAfter}
+}
+
+func (p throttledProvider) ApplyChanges(_ context.Context, _ plan.Changes) error {
+	return &provider.RateLimitError{RetryAfter: p.retryAfter}
+}
+
+func (p throttledProvider) AdjustEndpoints(eps []*endpoint.Endpoint) ([]*endpoint.Endpoint, error) {
+	return eps, nil
+}
+
+func (p throttledProvider) Throttled() bool { return true }
+
+func (p throttledProvider) CachedEndpoints(_ []string) ([]*endpoint.Endpoint, bool) {
+	return p.cached, p.hasCache
+}
+
+func throttledWebhook(retryAfter time.Duration) webhook {
+	cfg := config.Config{DomainFilters: []string{"example.com"}}
+	return webhook{desecClient: throttledProvider{retryAfter: retryAfter}, config: cfg}
+}
+
+// A deSEC throttle must surface to external-dns as 500 (a retryable SoftError),
+// NEVER 429, which external-dns treats as a hard fatal error. The real
+// Retry-After is still exposed for operators even though external-dns ignores
+// it.
+func TestRecordsHandler_ThrottleReturns500Not429(t *testing.T) {
+	webhook := throttledWebhook(600 * time.Second)
+
+	log.SetLevel(log.ErrorLevel)
+	defer log.SetLevel(log.InfoLevel)
+
+	req := httptest.NewRequest("GET", "/records", nil)
+	w := httptest.NewRecorder()
+	webhook.recordsHandler(w, req)
+
+	if w.Code == http.StatusTooManyRequests {
+		t.Fatalf("recordsHandler returned 429; external-dns treats that as fatal")
+	}
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("Status code = %v, want %v", w.Code, http.StatusInternalServerError)
+	}
+	if got := w.Header().Get("Retry-After"); got != "600" {
+		t.Errorf("Retry-After = %q, want \"600\"", got)
+	}
+}
+
+// While throttled, a full last-known-good cache is served as 200 rather than
+// failing, so external-dns keeps a correct view of the zone.
+func TestRecordsHandler_ServesCacheWhenWindowOpen(t *testing.T) {
+	cached := []*endpoint.Endpoint{
+		{DNSName: "a.example.com", RecordType: "A", Targets: endpoint.Targets{"192.0.2.1"}, RecordTTL: 3600},
+	}
+	webhook := webhook{
+		desecClient: throttledProvider{retryAfter: 600 * time.Second, cached: cached, hasCache: true},
+		config:      config.Config{DomainFilters: []string{"example.com"}},
+	}
+
+	log.SetLevel(log.ErrorLevel)
+	defer log.SetLevel(log.InfoLevel)
+
+	req := httptest.NewRequest("GET", "/records", nil)
+	w := httptest.NewRecorder()
+	webhook.recordsHandler(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("Status code = %v, want %v (cached serve)", w.Code, http.StatusOK)
+	}
+	var got []*endpoint.Endpoint
+	if err := json.NewDecoder(w.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(got) != 1 || got[0].DNSName != "a.example.com" {
+		t.Errorf("served endpoints = %v, want the cached set", got)
+	}
+}
+
+// A domain never fetched successfully has no cache, so the throttle must fall
+// through to 500 rather than serving a synthetic empty 200 -- an empty set
+// under --policy=sync would delete every record in the zone.
+func TestRecordsHandler_NoSyntheticEmptyWhenCacheMissing(t *testing.T) {
+	webhook := throttledWebhook(600 * time.Second) // hasCache defaults to false
+
+	log.SetLevel(log.ErrorLevel)
+	defer log.SetLevel(log.InfoLevel)
+
+	req := httptest.NewRequest("GET", "/records", nil)
+	w := httptest.NewRecorder()
+	webhook.recordsHandler(w, req)
+
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("Status code = %v, want %v (no cache -> 500, not empty 200)", w.Code, http.StatusInternalServerError)
+	}
+}
+
+func TestApplyChangesHandler_ThrottleReturns500Not429(t *testing.T) {
+	webhook := throttledWebhook(600 * time.Second)
+
+	log.SetLevel(log.ErrorLevel)
+	defer log.SetLevel(log.InfoLevel)
+
+	body, _ := json.Marshal(plan.Changes{
+		Create: []*endpoint.Endpoint{
+			{DNSName: "x.example.com", RecordType: "A", Targets: endpoint.Targets{"192.0.2.1"}, RecordTTL: 3600},
+		},
+	})
+	req := httptest.NewRequest("POST", "/records", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	webhook.applyChangesHandler(w, req)
+
+	if w.Code == http.StatusTooManyRequests {
+		t.Fatalf("applyChangesHandler returned 429; external-dns treats that as fatal")
+	}
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("Status code = %v, want %v", w.Code, http.StatusInternalServerError)
+	}
+	if got := w.Header().Get("Retry-After"); got != "600" {
+		t.Errorf("Retry-After = %q, want \"600\"", got)
+	}
+}
+
 func TestApplyChangesHandler(t *testing.T) {
 	tests := []struct {
 		name           string
@@ -364,6 +497,87 @@ func TestWebhookServerShutdown(t *testing.T) {
 	err = server.Shutdown(ctx)
 	if err != nil {
 		t.Errorf("Shutdown returned error: %v", err)
+	}
+}
+
+// TestApplyChangesHandler_DebugBodyDump verifies that with debug logging on,
+// the raw request body is written to the log so an operator can inspect
+// UpdateOld and other plan.Changes fields the summary log lines omit.
+func TestApplyChangesHandler_DebugBodyDump(t *testing.T) {
+	webhook := createTestWebhook()
+
+	body, err := json.Marshal(plan.Changes{
+		UpdateNew: []*endpoint.Endpoint{
+			{DNSName: "diag.example.com", RecordType: "TXT", Targets: endpoint.Targets{`"heritage=external-dns"`}, RecordTTL: 3600},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Failed to marshal changes: %v", err)
+	}
+
+	var buf bytes.Buffer
+	prevLevel := log.GetLevel()
+	prevOut := log.StandardLogger().Out
+	log.SetLevel(log.DebugLevel)
+	log.SetOutput(&buf)
+	defer func() {
+		log.SetLevel(prevLevel)
+		log.SetOutput(prevOut)
+	}()
+
+	req := httptest.NewRequest("POST", "/records", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	webhook.applyChangesHandler(w, req)
+
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("Status code = %v, want %v (logs: %s)", w.Code, http.StatusNoContent, buf.String())
+	}
+	if !bytes.Contains(buf.Bytes(), []byte("POST /records body:")) {
+		t.Errorf("expected debug log to contain body dump prefix, got: %s", buf.String())
+	}
+	if !bytes.Contains(buf.Bytes(), []byte("diag.example.com")) {
+		t.Errorf("expected debug log to contain the request body, got: %s", buf.String())
+	}
+}
+
+// TestApplyChangesHandler_NoDebugDumpAtInfoLevel verifies that at info level
+// (the default) the handler does not log the body and still serves the
+// request correctly -- so the diagnostic flag is opt-in.
+func TestApplyChangesHandler_NoDebugDumpAtInfoLevel(t *testing.T) {
+	webhook := createTestWebhook()
+
+	body, err := json.Marshal(plan.Changes{
+		Create: []*endpoint.Endpoint{
+			{DNSName: "quiet.example.com", RecordType: "A", Targets: endpoint.Targets{"192.0.2.1"}, RecordTTL: 3600},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Failed to marshal changes: %v", err)
+	}
+
+	var buf bytes.Buffer
+	prevLevel := log.GetLevel()
+	prevOut := log.StandardLogger().Out
+	log.SetLevel(log.InfoLevel)
+	log.SetOutput(&buf)
+	defer func() {
+		log.SetLevel(prevLevel)
+		log.SetOutput(prevOut)
+	}()
+
+	req := httptest.NewRequest("POST", "/records", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	webhook.applyChangesHandler(w, req)
+
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("Status code = %v, want %v", w.Code, http.StatusNoContent)
+	}
+	if bytes.Contains(buf.Bytes(), []byte("POST /records body:")) {
+		t.Errorf("info level should not emit body dump; got: %s", buf.String())
 	}
 }
 

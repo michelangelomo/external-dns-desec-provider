@@ -1,7 +1,10 @@
 package provider
 
 import (
+	"context"
+	"encoding/json"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/michelangelomo/external-dns-desec-provider/internal/config"
@@ -476,7 +479,7 @@ func TestConvertRRSetToEndpointExtended(t *testing.T) {
 			},
 			domain: "example.com",
 			expected: &endpoint.Endpoint{
-				DNSName:    "www.example.com.",
+				DNSName:    "www.example.com",
 				RecordType: "A",
 				Targets:    endpoint.Targets{"192.0.2.1", "192.0.2.2"},
 				RecordTTL:  300,
@@ -492,14 +495,14 @@ func TestConvertRRSetToEndpointExtended(t *testing.T) {
 			},
 			domain: "example.com",
 			expected: &endpoint.Endpoint{
-				DNSName:    "_dmarc.example.com.",
+				DNSName:    "_dmarc.example.com",
 				RecordType: "TXT",
 				Targets:    endpoint.Targets{"v=DMARC1; p=reject"},
 				RecordTTL:  3600,
 			},
 		},
 		{
-			name: "Domain with trailing dot",
+			name: "Apex record with dotted domain still emits dotless DNSName",
 			input: &desec.RRSet{
 				SubName: "",
 				Type:    "A",
@@ -508,7 +511,7 @@ func TestConvertRRSetToEndpointExtended(t *testing.T) {
 			},
 			domain: "example.com.",
 			expected: &endpoint.Endpoint{
-				DNSName:    "example.com.",
+				DNSName:    "example.com",
 				RecordType: "A",
 				Targets:    endpoint.Targets{"192.0.2.1"},
 				RecordTTL:  300,
@@ -567,7 +570,7 @@ func TestApplyChangesDryRun(t *testing.T) {
 	}
 
 	// This should not return an error in dry run mode
-	err = client.ApplyChanges(changes)
+	err = client.ApplyChanges(context.Background(), changes)
 	if err != nil {
 		t.Errorf("ApplyChanges in dry run mode returned error: %v", err)
 	}
@@ -787,6 +790,40 @@ func TestAdjustEndpoints(t *testing.T) {
 	}
 }
 
+// TestConvertRRSetToEndpoint_DNSNameHasNoTrailingDot pins the read-path
+// invariant that prevents the providerSpecific txt/force-update=true loop:
+// external-dns sources emit DNSName without a trailing dot, and the TXT
+// registry matches companion records by exact-string DNSName. If /records
+// returns a dotted form, every reconcile produces a no-op Update on every
+// record (observed in deploy as "0 creates, 10 updates, 0 deletes").
+func TestConvertRRSetToEndpoint_DNSNameHasNoTrailingDot(t *testing.T) {
+	cases := []struct {
+		name    string
+		subname string
+		domain  string
+		want    string
+	}{
+		{"subdomain", "www", "example.com", "www.example.com"},
+		{"apex", "", "example.com", "example.com"},
+		{"deep subdomain", "foo.bar", "example.com", "foo.bar.example.com"},
+		{"domain passed with trailing dot still strips", "www", "example.com.", "www.example.com"},
+		{"apex with domain trailing dot still strips", "", "example.com.", "example.com"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ep := convertRRSetToEndpoint(&desec.RRSet{
+				SubName: tc.subname,
+				Type:    "A",
+				Records: []string{"192.0.2.1"},
+				TTL:     3600,
+			}, tc.domain)
+			if ep.DNSName != tc.want {
+				t.Errorf("DNSName = %q, want %q", ep.DNSName, tc.want)
+			}
+		})
+	}
+}
+
 func TestSubDomainScenarios(t *testing.T) {
 	tests := []struct {
 		name          string
@@ -952,5 +989,30 @@ func TestSubDomainConvertEndpointToRRSet(t *testing.T) {
 				t.Errorf("convertEndpointToRRSet() = %+v, want %+v", result, tt.expected)
 			}
 		})
+	}
+}
+
+// TestApexRRSetJSONIncludesEmptySubname is a regression guard for
+// nrdcg/desec#fd7f5e0 ("fix: subname as empty string"), released in
+// v0.11.2. Before the fix, RRSet.SubName was tagged
+// `json:"subname,omitempty"`, which dropped the field for apex RRsets
+// and triggered `400 {"subname":["This field is required."]}` from the
+// deSEC API. If the dependency ever rolls back to a release that
+// reintroduces omitempty, this test fails loudly. See bug-2.md.
+func TestApexRRSetJSONIncludesEmptySubname(t *testing.T) {
+	rrset := convertEndpointToRRSet(&endpoint.Endpoint{
+		DNSName:    "example.com",
+		RecordType: "A",
+		Targets:    endpoint.Targets{"192.0.2.1"},
+		RecordTTL:  3600,
+	}, "example.com", 3600)
+
+	out, err := json.Marshal(rrset)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+
+	if !strings.Contains(string(out), `"subname":""`) {
+		t.Errorf("apex RRSet JSON must include `\"subname\":\"\"` (deSEC rejects POST bodies without subname): got %s", out)
 	}
 }

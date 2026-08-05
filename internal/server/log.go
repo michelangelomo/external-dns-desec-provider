@@ -50,15 +50,15 @@ func NewLogger(opts ...LogOptions) *LoggingMiddleware {
 		opt = opts[0]
 	}
 
-	if opt.Formatter == nil {
-		opt.Formatter = &logrus.TextFormatter{
-			DisableColors:   true,
-			TimestampFormat: time.RFC3339,
-		}
+	// Use the app's standard logger so the middleware honours the configured
+	// level and output. A private logrus.New() here silently discards the
+	// start/completion lines (they were logged below the default level and to
+	// a separate sink), which hid that a /records handler had started but
+	// never completed during the deSEC throttle hang.
+	log := logrus.StandardLogger()
+	if opt.Formatter != nil {
+		log.Formatter = opt.Formatter
 	}
-
-	log := logrus.New()
-	log.Formatter = opt.Formatter
 
 	return &LoggingMiddleware{
 		logger:         log,
